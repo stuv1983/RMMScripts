@@ -1,25 +1,21 @@
 <# 
 .SYNOPSIS
-  SecurityCheck.ps1 — NOC/MSP endpoint security posture check (PowerShell 5.1+).
+  AVCheck.ps1 — Endpoint Antivirus and MDE security posture check (PowerShell 5.1+).
 
 .DESCRIPTION
-  Performs a comprehensive security and health audit, including deep AV status checks
-  using heuristics, MDE, Firewall, and modern security controls like VBS/HVCI and LAPS.
-  Default output is a one-liner; use -Full for ticket notes; -AsJson for parsing.
-  
-  Covers: AV, Firewall, MDE, Windows Update currency, Pending reboot, Last reboot/uptime,
-          VBS/HVCI, LAPS, and PowerShell Script Logging.
+  Performs a comprehensive audit of Antivirus (Defender/3rd-party) status and MDE 
+  onboarding using advanced heuristics to avoid stale Windows Security Center (WSC) false-negatives.
   
 .EXIT CODES
-  0 = Secure
-  1 = Warning (reboot pending, old signatures, stale WSC, etc.)
-  2 = Critical (no active AV, firewall off, critical control missing/off)
+  0 = Secure (Active AV and MDE status OK)
+  1 = Warning (Signatures stale, Defender in Passive Mode, or WSC issue)
+  2 = Critical (No active AV, core service stopped, or Real-Time Protection is OFF)
   4 = Script Error (e.g., failed PowerShell version check)
 #>
 
 [CmdletBinding()]
 param(
-  # ===== Output modes - CHANGED TO [object] FOR RMM STRING COMPATIBILITY =====
+  # ===== Output modes - Use [object] for RMM string compatibility =====
   [Parameter()] [object]$Full, 
   [Parameter()] [object]$AsJson,
 
@@ -27,29 +23,20 @@ param(
   [switch]$Strict,
   [switch]$AssumeDefenderRTWhenServiceRunning = $true,
 
-  # ===== Minimum requirements (set these to trigger Critical/Warning issues) =====
+  # ===== Thresholds & Requirements =====
   [int]$StaleHours = 72, 
   [int]$SigFreshHours = 48,
   [int]$MaxQuickScanAgeDays = 14, 
   [int]$MaxFullScanAgeDays = 30,
-  [int]$WUCurrencyDays = 30,
-  [int]$UptimeWarningDays = 45, # Days since last reboot to warn
-  [switch]$RequireFirewallOn = $true, 
-  [switch]$RequireRealTime = $false, 
-  [switch]$RequireMDE,
-  [switch]$RequireVBS,
-  [switch]$RequireLAPS,
-  [switch]$RequireScriptLogging,
+  [switch]$RequireRealTime = $false, # Require Real-Time Protection to be on
+  [switch]$RequireMDE,               # Require MDE to be onboarded
 
-  # ===== Test/lab overrides =====
+  # ===== Test/lab overrides (retained for testing complex AV states) =====
   [string[]]$VendorFilter,
   [ValidateSet('Auto','Bitdefender','ThirdParty','DefenderBusiness','DefenderConsumer','None')]
   [string]$ForceClassification = 'Auto',
-  [ValidateSet('Auto','On','Off')][string]$ForceFirewall = 'Auto',
   [ValidateSet('Auto','True','False')][string]$ForceSigUpToDate = 'Auto',
   [ValidateSet('Auto','True','False')][string]$ForceSense = 'Auto',
-
-  # ===== Vendor simulation for testing =====
   [string]$ForceVendor = '', 
   [switch]$ForceVendorPresent,
   [ValidateSet('Running','Stopped','Unknown')][string]$ForceVendorServiceStatus = 'Running'
@@ -64,18 +51,14 @@ function Convert-ToBool {
     <#
     .SYNOPSIS
         Converts RMM-provided parameter values ("true"/"false", "1"/"0") to [bool].
-    .DESCRIPTION
-        Accepts $null, [bool], numbers, or strings. This is essential for RMM engines.
     #>
     param([Parameter(ValueFromPipeline)][AllowNull()][object]$Value)
     process {
         if ($null -eq $Value) { return $false }
         if ($Value -is [bool]) { return $Value }
-        # Numbers: treat non-zero as true
         if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
             return [bool]([int]$Value)
         }
-        # Strings: normalize and convert
         $v = "$Value".Trim().ToLowerInvariant()
         switch ($v) {
             'true'  { return $true }
@@ -87,19 +70,20 @@ function Convert-ToBool {
     }
 }
 
+function BoolStr([bool]$b){ if($b){'True'}else{'False'} }
+
 # --- RMM Parameter Conversion ---
-# Convert RMM string inputs for the output modes to proper Booleans
 $Full   = Convert-ToBool $Full
 $AsJson = Convert-ToBool $AsJson
 
-# Check for minimum required PowerShell version (5.1 or later for modern cmdlets)
+# Check for minimum required PowerShell version (5.1 or later)
 if ($PSVersionTable.PSVersion.Major -lt 5) {
   Write-Host "ERROR: PowerShell v5.1 or later is required. Detected: $($PSVersionTable.PSVersion.ToString())"
   exit 4
 }
 
 
-# ----------------------------- CORE HELPER FUNCTIONS (UNCHANGED) -----------------------------
+# ----------------------------- CORE AV CHECK FUNCTIONS -----------------------------
 
 function Get-SC2AV { # Windows Security Center (all registered AV)
   try { Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop }
@@ -168,7 +152,6 @@ function Get-RelatedServices { # Spot 3rd‑party engines/EDR by services
   if($hits){ $hits | Sort-Object Name -Unique | Select-Object Name,DisplayName,Status,StartType }
 }
 
-# Map common vendor -> service name patterns to improve detection
 $script:VendorServiceMap = @{
   'AVG'                = @('avgsvc','avgsrvc','AVGSvc')
   'Avast'              = @('AvastSvc','aswidsagent','aswToolsSvc')
@@ -233,61 +216,20 @@ function Get-ThirdPartyRTHeuristic { param([array]$Products,[array]$Services) # 
 function Get-VendorServiceStatus { # Report 3rd‑party service state for summary
   param([Parameter(Mandatory=$true)][string]$VendorName,[array]$Services)
   if (-not $Services) { return 'Unknown' }
-  # 1) Specific name patterns from map
   if ($script:VendorServiceMap.ContainsKey($VendorName)){
     $hit = $Services | Where-Object { $n=$_.Name; foreach($m in $script:VendorServiceMap[$VendorName]){ if($n -like "*$m*"){ return $true } }; return $false } | Select-Object -First 1
     if ($hit) { return "{0}" -f $hit.Status }
   }
-  # 2) Tight vendor name match
   $match = $Services | Where-Object {
     $_.DisplayName -match [regex]::Escape($VendorName) -or $_.Name -match ($VendorName -replace '\s+','')
   } | Select-Object -First 1
   if ($match) { return $match.Status.ToString() }
-  # 3) Loose contains match
   $match = $Services | Where-Object { ($_.DisplayName + ' ' + $_.Name) -match [regex]::Escape($VendorName) } | Select-Object -First 1
   if ($match) { return $match.Status.ToString() }
   'Unknown'
 }
 
-function Get-VBSStatus { # Virtualization Based Security / HVCI check
-    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
-    $vbs = $false; $hvci = $false
-    if (Test-Path $regPath) {
-        $props = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
-        # 1 means VBS is enabled
-        if ($props.EnableVirtualizationBasedSecurity -eq 1) { $vbs = $true }
-        # 1 means HVCI (Code Integrity) is enabled
-        if ($props.EnableSystemProtectedFiles -eq 1) { $hvci = $true }
-    }
-    [pscustomobject]@{ VBSOn=$vbs; HVCIPresent=$hvci }
-}
-
-function Get-LAPSStatus { # Client-side LAPS status
-    $lapsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS'
-    $installed = (Test-Path 'C:\Windows\system32\AdmPwd.dll') -or (Test-Path $lapsKey) # Basic file/key check
-    $passwordAgeDays = $null
-    if (Test-Path $lapsKey) {
-        $props = Get-ItemProperty $lapsKey -ErrorAction SilentlyContinue
-        $lastUpdate = $props.PasswordLastUpdateTimestamp
-        if ($lastUpdate -is [datetime]) {
-            $passwordAgeDays = ((Get-Date) - $lastUpdate).TotalDays
-        }
-    }
-    [pscustomobject]@{ Installed=$installed; LastUpdateTimestamp=$lastUpdate; PasswordAgeDays=$passwordAgeDays }
-}
-
-function Get-PowerShellLoggingStatus { # PowerShell Script Block Logging status
-    $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
-    $enabled = $false
-    if (Test-Path $regPath) {
-        $value = (Get-ItemProperty $regPath -ErrorAction SilentlyContinue).EnableScriptBlockLogging
-        # 1 means Script Block Logging is enabled
-        if ($value -eq 1) { $enabled = $true }
-    }
-    [pscustomobject]@{ Enabled=$enabled }
-}
-
-# ----------------------------- Telemetry -----------------------------
+# ----------------------------- TELEMETRY & CLASSIFICATION -----------------------------
 
 $mp=$null; if(Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue){$mp=Get-MpComputerStatus -ErrorAction SilentlyContinue}
 $sc=@(Get-SC2AV)
@@ -312,10 +254,7 @@ if($VendorFilter -and $VendorFilter.Count -gt 0){
 
 # Test mode: inject fake vendor
 if ($ForceVendorPresent -and -not [string]::IsNullOrWhiteSpace($ForceVendor)) {
-  $products += [pscustomobject]@{
-    DisplayName=$ForceVendor; ProductStateRaw='0x61100'; RealTime=$true; SigUpToDate=$true
-    ProductExe="$ForceVendor.exe"; ReportingExe="$ForceVendor-Reporter.exe"; Timestamp=(Get-Date).ToString('r'); IsStale=$false
-  }
+  $products += [pscustomobject]@{ DisplayName=$ForceVendor; ProductStateRaw='0x61100'; RealTime=$true; SigUpToDate=$true; ProductExe="$ForceVendor.exe"; Timestamp=(Get-Date).ToString('r'); IsStale=$false }
   if (-not $svcs) { $svcs=@() }
   $svcs += [pscustomobject]@{ Name=($ForceVendor -replace '\s+','') + 'Svc'; DisplayName="$ForceVendor Engine"; Status=$ForceVendorServiceStatus; StartType='Automatic' }
   if ($ForceClassification -eq 'Auto') { $activeThird = $products | Where-Object { $_.DisplayName -eq $ForceVendor } | Select-Object -First 1 }
@@ -323,14 +262,10 @@ if ($ForceVendorPresent -and -not [string]::IsNullOrWhiteSpace($ForceVendor)) {
 
 $mde=Get-MDE; 
 $def=Get-Defender
-$vbs=Get-VBSStatus            
-$laps=Get-LAPSStatus          
-$pslog=Get-PowerShellLoggingStatus 
-
 $third=@(); $heuristicUsed=$false
 if(-not $Strict){ $third=Get-ThirdPartyRTHeuristic -Products $products -Services $svcs }
 
-# ----------------------------- Classification -----------------------------
+# --- Classification Logic ---
 $label=$null; $confidence='Low'
 if(-not $activeThird){ $activeThird = $products | Where-Object { $_.RealTime -eq $true -and $_.DisplayName -notmatch 'Defender' } | Select-Object -First 1 }
 if($activeThird){ if($activeThird.DisplayName -match 'Bitdefender|Managed Antivirus'){$label='N-able Managed AV (Bitdefender)'}else{$label='Other 3rd-party AV'}; $confidence='High' }
@@ -348,7 +283,8 @@ if(-not $label){ $label='No active AV'; $confidence='Low' }
 if($ForceClassification -ne 'Auto'){ switch($ForceClassification){'Bitdefender'{$label='N-able Managed AV (Bitdefender)'}'ThirdParty'{$label='Other 3rd-party AV'}'DefenderBusiness'{$label='Defender - Business'}'DefenderConsumer'{$label='Defender - Consumer'}'None'{$label='No active AV'}}; $confidence='Forced' }
 $bitdef=$null; if($label -eq 'N-able Managed AV (Bitdefender)'){ $bitdef=Get-BitdefenderInfo }
 
-# ----------------------------- Evaluation -----------------------------
+# ----------------------------- EVALUATION -----------------------------
+
 $issues=@(); $severity='Secure'
 function Add-Issue { param([string]$Message,[ValidateSet('Critical','Warning','Info')][string]$Level)
   $script:issues += $Message
@@ -390,43 +326,8 @@ if($label -eq 'Other 3rd-party AV'){
 # --- MDE Enforcement ---
 if ($RequireMDE -and -not $mde.Onboarded){ Add-Issue 'MDE is required but not onboarded' 'Critical' }
 
-# --- VBS (Credential Guard / HVCI) Check ---
-if ($RequireVBS -and -not $vbs.VBSOn){ Add-Issue 'Virtualization-Based Security (VBS) is required but OFF' 'Critical' }
+# ----------------------------- RESULT OBJECT -----------------------------
 
-# --- LAPS Check ---
-if ($RequireLAPS -and -not $laps.Installed){ Add-Issue 'LAPS is required but not detected (client-side)' 'Warning' }
-
-# --- PowerShell Logging Check ---
-if ($RequireScriptLogging -and -not $pslog.Enabled){ Add-Issue 'PowerShell Script Block Logging is required but OFF' 'Warning' }
-
-
-# ----------------------------- System health -----------------------------
-$fwState='Unknown'
-try{ $fw=Get-CimInstance -ClassName Win32_Service -Filter "Name='mpssvc'" -ErrorAction Stop; $fwState= if($fw.State -eq 'Running'){'On'}else{'Off'} }
-catch{ try{ $pf=Get-NetFirewallProfile -ErrorAction Stop; $fwState= if($pf.Enabled -contains $true){'On'}else{'Off'} } catch{ $fwState='Unknown' } }
-if($ForceFirewall -ne 'Auto'){$fwState=$ForceFirewall}
-if($RequireFirewallOn){ if($fwState -ne 'On'){ Add-Issue 'Firewall is OFF' 'Critical' } }
-
-$WU_Last='Unknown'; $WU_AgeDays=$null
-try{
-  $qfe=Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop | Sort-Object InstalledOn -Descending | Select-Object -First 1
-  $inst=$null; if($qfe -and $qfe.InstalledOn){ try{$inst=[datetime]$qfe.InstalledOn}catch{try{$inst=[datetime]::Parse($qfe.InstalledOn)}catch{$inst=$null}} }
-  if($null -ne $inst){ $WU_Last=$inst.ToString('yyyy-MM-dd'); $WU_AgeDays=((Get-Date)-$inst).TotalDays; if($WU_AgeDays -gt $WUCurrencyDays){ Add-Issue ("Last Windows update installed {0:N0} days ago" -f $WU_AgeDays) 'Warning' } }
-  else { $WU_Last='None'; Add-Issue 'No Windows updates detected in history' 'Warning' }
-}catch{ $WU_Last='Unknown'; Add-Issue 'Unable to read Windows Update history' 'Warning' }
-
-$RebootPending='Unknown'
-try{
-  $pending=$false; $paths=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired','HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations')
-  foreach($p in $paths){ if(Test-Path $p){ $pending=$true } }
-  if($pending){ $RebootPending='Yes'; Add-Issue 'System restart pending after updates or installs' 'Warning' } else { $RebootPending='No' }
-}catch{ $RebootPending='Unknown'; Add-Issue 'Could not verify reboot status' 'Warning' }
-
-$lastBootString='Unknown'
-$upt=0
-try{ $boot=(Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime; $upt=((Get-Date)-[datetime]$boot).TotalDays; $lastBootString=("{0} (uptime {1:N0} days)" -f $boot,$upt); if($upt -gt $UptimeWarningDays){ Add-Issue ("System uptime exceeds {0:N0} days" -f $upt) 'Warning' } }catch{ $lastBootString='Unknown' }
-
-# ----------------------------- Result shape -----------------------------
 $summaryAV= switch($label){
   'N-able Managed AV (Bitdefender)'{'N-able (Bitdefender)'}
   'Other 3rd-party AV' { if($activeThird){$activeThird.DisplayName}else{'3rd-party AV'} }
@@ -435,7 +336,7 @@ $summaryAV= switch($label){
   default{'Not detected'}
 }
 
-# Third‑party service status in summary (e.g., AVG Anti-Virus Service: Running)
+# AV Service status in summary
 $avSvc='Unknown'
 if ($label -like 'Defender*') {
   $avSvc = $def.ServiceStatus
@@ -447,7 +348,6 @@ elseif ($label -eq 'Other 3rd-party AV' -and $activeThird) {
   $vendorName = $activeThird.DisplayName
   $svcStatus  = Get-VendorServiceStatus -VendorName $vendorName -Services $svcs
   if ($svcStatus -ne 'Unknown') {
-    # Use DisplayName for cleaner output (e.g. 'AVG Anti-Virus Service: Running')
     $svcObj = $svcs | Where-Object { $_.DisplayName -match [regex]::Escape($vendorName) -or $_.Name -match ($vendorName -replace '\s+','') } | Select-Object -First 1
     $svcName = if ($svcObj) { $svcObj.DisplayName } else { $vendorName }
     $avSvc   = "{0}: {1}" -f $svcName, $svcStatus  
@@ -455,62 +355,41 @@ elseif ($label -eq 'Other 3rd-party AV' -and $activeThird) {
 }
 
 $mdeLine = if($mde.Onboarded){ "Onboarded (Sense=$($mde.SenseStatus))" } else { "Not onboarded" }
-$vbsLine = if($vbs.VBSOn){ "On (HVCI=$($vbs.HVCIPresent))" } else { "Off" }
-$lapsLine = if($laps.Installed){ "Detected" } else { "Not detected" }
-$pslogLine = if($pslog.Enabled){ "Enabled" } else { "Disabled" }
-
-function BoolStr([bool]$b){ if($b){'True'}else{'False'} }
 
 $script:elapsedTime = ((Get-Date) - $script:startTime).TotalSeconds
 $result=[pscustomobject]@{
   Timestamp=(Get-Date).ToString('s'); ComputerName=$env:COMPUTERNAME
   Status=$severity; Issues=$issues; Classification=$label; Confidence=$confidence
-  Summary=[pscustomobject]@{ ActiveAV=$summaryAV; AVService=$avSvc; MDE=$mdeLine; Firewall=$fwState; WindowsUpdateLast=$WU_Last; PendingReboot=$RebootPending; LastReboot=$lastBootString; VBS=$vbsLine; LAPS=$lapsLine; PSLogging=$pslogLine; ElapsedTimeSec=$script:elapsedTime }
+  Summary=[pscustomobject]@{ ActiveAV=$summaryAV; AVService=$avSvc; MDE=$mdeLine; ElapsedTimeSec=$script:elapsedTime }
   MicrosoftDefender=$def
   MDE=[pscustomobject]@{SensePresent=$mde.SensePresent;SenseStatus=$mde.SenseStatus;Onboarded=$mde.Onboarded}
-  VBS=$vbs 
-  LAPS=$laps 
-  PSLogging=$pslog 
   SecurityCenter=$products; Bitdefender=$bitdef; RelatedServices=$svcs; ThirdPartyHeuristic=$third
   Parameters=[pscustomobject]@{ 
-    StaleHours=$StaleHours; SigFreshHours=$SigFreshHours; MaxQuickScanAgeDays=$MaxQuickScanAgeDays; MaxFullScanAgeDays=$MaxFullScanAgeDays; WUCurrencyDays=$WUCurrencyDays
-    UptimeWarningDays=$UptimeWarningDays;
-    RequireFirewallOn=[bool]$RequireFirewallOn; RequireRealTime=[bool]$RequireRealTime; RequireMDE=[bool]$RequireMDE; RequireVBS=[bool]$RequireVBS; RequireLAPS=[bool]$RequireLAPS; RequireScriptLogging=[bool]$RequireScriptLogging; Strict=[bool]$Strict
-    ForceClassification=$ForceClassification; ForceFirewall=$ForceFirewall; ForceSigUpToDate=$ForceSigUpToDate; ForceSense=$ForceSense; HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
+    StaleHours=$StaleHours; SigFreshHours=$SigFreshHours; MaxQuickScanAgeDays=$MaxQuickScanAgeDays; MaxFullScanAgeDays=$MaxFullScanAgeDays;
+    RequireRealTime=[bool]$RequireRealTime; RequireMDE=[bool]$RequireMDE; Strict=[bool]$Strict
+    ForceClassification=$ForceClassification; ForceSigUpToDate=$ForceSigUpToDate; ForceSense=$ForceSense; HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
     ForceVendor=$ForceVendor; ForceVendorPresent=[bool]$ForceVendorPresent; ForceVendorServiceStatus=$ForceVendorServiceStatus }
 }
 
-# ----------------------------- Output -----------------------------
+# ----------------------------- OUTPUT -----------------------------
 if($AsJson){
   try{ $result | ConvertTo-Json -Depth 6 }catch{ $result | Out-String }
 }elseif(-not $Full){
   $issuesText = if($issues -and $issues.Count -gt 0){ ' | Issues: ' + ($issues -join '; ') } else { '' }
-  Write-Output ("[{0}] {1} | Status:{2} | AV:{3} | Svc:{4} | MDE:{5} | FW:{6} | VBS:{7} | WU:{8} | PendingReboot:{9} | LastReboot:{10}{11}" -f `
-    $result.Timestamp,$result.ComputerName,$result.Status,$result.Summary.ActiveAV,$result.Summary.AVService,$result.Summary.MDE,$result.Summary.Firewall,$result.Summary.VBS,$result.Summary.WindowsUpdateLast,$result.Summary.PendingReboot,$result.Summary.LastReboot,$issuesText)
+  Write-Output ("[{0}] {1} | Status:{2} | AV:{3} | Svc:{4} | MDE:{5}{6}" -f `
+    $result.Timestamp,$result.ComputerName,$result.Status,$result.Summary.ActiveAV,$result.Summary.AVService,$result.Summary.MDE,$issuesText)
 }else{
-  Write-Host "===== SECURITY SUMMARY (Elapsed: $($result.Summary.ElapsedTimeSec)s) ====="
+  Write-Host "===== AV SECURITY SUMMARY (Elapsed: $($result.Summary.ElapsedTimeSec)s) ====="
   Write-Host ("Status: {0}" -f $result.Status)
   if($issues -and $issues.Count -gt 0){ Write-Host ("Issues: {0}" -f ($issues -join '; ')) } else { Write-Host "Issues: (none)" }
   Write-Host ("Active AV: {0}" -f $result.Summary.ActiveAV)
   Write-Host ("AV Service: {0}" -f $result.Summary.AVService)
-  Write-Host ("Firewall: {0}" -f $result.Summary.Firewall)
-  Write-Host ("Pending Reboot: {0}" -f $result.Summary.PendingReboot)
-  Write-Host ("Windows Update (last installed): {0}" -f $result.Summary.WindowsUpdateLast)
-  Write-Host ("Last Reboot: {0}" -f $result.Summary.LastReboot)
+  Write-Host ("MDE Onboarding: {0}" -f $result.Summary.MDE)
   Write-Host ("Confidence: {0}" -f $result.Confidence)
-
-  Write-Host "`n--- Microsoft Security Controls ---"
-  Write-Host ("  MDE Onboarding: {0}" -f $result.Summary.MDE)
-  Write-Host ("  VBS/HVCI Status: {0}" -f $result.Summary.VBS)
-  Write-Host ("  LAPS Client: {0} (Age: {1:N0} days)" -f $result.Summary.LAPS, $result.LAPS.PasswordAgeDays)
-  Write-Host ("  PS Script Logging: {0}" -f $result.Summary.PSLogging)
-
 
   Write-Host "`n--- Microsoft Defender Detail ---"
   Write-Host ("  Present:{0} Service:{1} RT:{2} Passive:{3}" -f (BoolStr $def.Present), $def.ServiceStatus, (BoolStr $def.RealTimeProtectionEnabled), (BoolStr $def.PassiveMode))
-  Write-Host ("  Engine:{0} Platform:{1} ServiceVer:{2}" -f $def.EngineVersion, $def.PlatformVersion, $def.ServiceVersion)
-  Write-Host ("  AVSig:{0} ASWSig:{1} NISEngine:{2}" -f $def.AVSignatureVersion, $def.ASWSignatureVersion)
-  Write-Host ("  SigLastUpdated:{0} SigAgeHours:{1:N1}" -f $def.SigLastUpdated, $def.SigAgeHours)
+  Write-Host ("  AVSig:{0} SigAgeHours:{1:N1}" -f $def.AVSignatureVersion, $def.SigAgeHours)
   Write-Host ("  LastFullScan:{0} LastQuickScan:{1}" -f $def.LastFullScan, $def.LastQuickScan)
 
   Write-Host "`n--- Security Center Products ---"
@@ -522,25 +401,12 @@ if($AsJson){
     }
   }
 
-  if($bitdef){
-    Write-Host "`n--- Bitdefender BEST ---"
-    Write-Host ("  Version:{0}" -f $bitdef.Version)
-    Write-Host ("  ServiceStatus:{0}" -f $bitdef.ServiceStatus)
-  }
-
   Write-Host "`n--- Related Security Services ---"
   if($svcs){ $svcs | ForEach-Object { Write-Host ("  {0} | {1} | {2} | {3}" -f $_.Name, $_.DisplayName, $_.Status, $_.StartType) } } else { Write-Host "  (none found)" }
-
-  Write-Host "`n--- Third-Party Heuristic ---"
-  if($third -and $third.Count -gt 0){
-    $third | ForEach-Object { Write-Host ("  {0} | InferredActive:{1} | CoreSvc:{2} | WSC_RT:{3} | Stale:{4} | {5}" -f $_.Vendor, (BoolStr $_.InferredActive), (BoolStr $_.CoreSvcRunning), $_.WSC_RT, $_.WSC_Stale, $_.Reason) }
-  } else { Write-Host "  (none)" }
   
   Write-Host "`n--- Parameters & Thresholds ---"
-  Write-Host ("  StaleHours:{0} SigFreshHours:{1} MaxQuickScanAgeDays:{2} MaxFullScanAgeDays:{3} WUCurrencyDays:{4}" -f $StaleHours, $SigFreshHours, $MaxQuickScanAgeDays, $MaxFullScanAgeDays, $WUCurrencyDays)
-  Write-Host ("  UptimeWarningDays:{0}" -f $UptimeWarningDays)
-  Write-Host ("  RequireFirewallOn:{0} RequireRealTime:{1} RequireMDE:{2}" -f ([bool]$RequireFirewallOn), ([bool]$RequireRealTime), ([bool]$RequireMDE))
-  Write-Host ("  RequireVBS:{0} RequireLAPS:{1} RequireScriptLogging:{2} Strict:{3}" -f ([bool]$RequireVBS), ([bool]$RequireLAPS), ([bool]$RequireScriptLogging), ([bool]$Strict))
+  Write-Host ("  SigFreshHours:{0} MaxQuickScanAgeDays:{1} MaxFullScanAgeDays:{2}" -f $SigFreshHours, $MaxQuickScanAgeDays, $MaxFullScanAgeDays)
+  Write-Host ("  RequireRealTime:{0} RequireMDE:{1} Strict:{2}" -f ([bool]$RequireRealTime), ([bool]$RequireMDE), ([bool]$Strict))
 }
 
 # ----------------------------- Exit codes -----------------------------
