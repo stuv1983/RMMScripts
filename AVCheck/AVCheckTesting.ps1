@@ -15,24 +15,44 @@
 
 [CmdletBinding()]
 param(
-  # ===== Output modes - Use [object] for RMM string compatibility =====
+  # ===== Output modes - Use [object] for RMM string compatibility (UPDATED FOR RMM) =====
   [Parameter()] [object]$Full, 
   [Parameter()] [object]$AsJson,
 
   # ===== Behaviour toggles =====
-  [Parameter()] [object]$Strict, 
-  [Parameter()] [object]$AssumeDefenderRTWhenServiceRunning = $true, 
+  [Parameter()] [object]$Strict, # Converted to object for RMM compatibility
+  [Parameter()] [object]$AssumeDefenderRTWhenServiceRunning = $true, # Converted to object for RMM compatibility
 
   # ===== Thresholds & Requirements =====
   [int]$StaleHours = 72, 
   [int]$SigFreshHours = 48,
   [int]$MaxQuickScanAgeDays = 14, 
   [int]$MaxFullScanAgeDays = 30,
-  [Parameter()] [object]$RequireRealTime = $false, 
-  [Parameter()] [object]$RequireMDE,               
+  [Parameter()] [object]$RequireRealTime = $false, # Converted to object for RMM compatibility
+  [Parameter()] [object]$RequireMDE,               # Converted to object for RMM compatibility
 
-  # ===== Filtering overrides (Only kept for production filtering needs) =====
-  [string[]]$VendorFilter
+  # ===== Test/lab overrides (retained for testing complex AV states) =====
+  [string[]]$VendorFilter,
+  [ValidateSet('Auto','Bitdefender','ThirdParty','DefenderBusiness','DefenderConsumer','None')]
+  [string]$ForceClassification = 'Auto',
+  [ValidateSet('Auto','True','False')][string]$ForceSigUpToDate = 'Auto',
+  [ValidateSet('Auto','True','False')][string]$ForceSense = 'Auto',
+  [string]$ForceVendor = '', 
+  [Parameter()] [object]$ForceVendorPresent, # Converted to object for RMM compatibility
+  [ValidateSet('Running','Stopped','Unknown')][string]$ForceVendorServiceStatus = 'Running',
+  
+  # === NEW PARAMETERS FOR THRESHOLD SPOOFING ===
+  [ValidateSet('Auto','True','False')][string]$ForceSigFresh = 'Auto', # Force Signature Freshness Check Result
+  [ValidateSet('Auto','True','False')][string]$ForceScansCurrent = 'Auto', # Force Scan Age Check Result
+  # =============================================
+  
+  # === NEW PARAMETER TO FORCE 3RD PARTY AV VENDOR NAME ===
+  [string]$ForceActiveAVVendor = '', # New string parameter to specify a 3rd party vendor name
+  # =======================================================
+  
+  # ===== NEW TEST MODE SWITCH for MDE Call Checks (UPDATED FOR RMM) =====
+  [Parameter()] [object]$TestMDE,                  # Forces MDE to report as Onboarded and Sense as Running.
+  [ValidateSet('Auto','True','False')][string]$ForceOnboarded = 'Auto' # Specific MDE onboarding override.
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -65,7 +85,7 @@ function Convert-ToBool {
 
 function BoolStr([bool]$b){ if($b){'True'}else{'False'} }
 
-# --- RMM Parameter Conversion ---
+# --- RMM Parameter Conversion (UPDATED) ---
 $Full   = Convert-ToBool $Full
 $AsJson = Convert-ToBool $AsJson
 # Convert previously switch/boolean parameters to handle RMM string inputs
@@ -73,6 +93,16 @@ $Strict = Convert-ToBool $Strict
 $AssumeDefenderRTWhenServiceRunning = Convert-ToBool $AssumeDefenderRTWhenServiceRunning
 $RequireRealTime = Convert-ToBool $RequireRealTime
 $RequireMDE = Convert-ToBool $RequireMDE
+$ForceVendorPresent = Convert-ToBool $ForceVendorPresent
+$TestMDE = Convert-ToBool $TestMDE
+
+# --- Process TestMDE and set overrides ---
+if ($TestMDE) {
+  # If TestMDE is used, force Sense to running and Onboarded to true, 
+  # unless a specific Force* parameter has already been set.
+  if ($ForceSense -eq 'Auto') { $ForceSense = 'True' }
+  if ($ForceOnboarded -eq 'Auto') { $ForceOnboarded = 'True' }
+}
 
 
 # Check for minimum required PowerShell version (5.1 or later)
@@ -107,11 +137,23 @@ function Get-MDE { # MDE Sense + registry onboarding
   $onb=$false; $reg='HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status'
   if (Test-Path $reg){ $v=(Get-ItemProperty $reg -ErrorAction SilentlyContinue).OnboardingState; if($null -ne $v -and 1 -eq [int]$v){$onb=$true} }
   
-  # --- MDE LIVE LOGIC ---
+  # --- MDE TEST OVERRIDE LOGIC ---
   $isSensePresent = [bool]$svc
   $isSenseRunning = ($status -eq 'Running' -or $status -eq 'StartPending')
   $isOnboarded    = $onb
-  # --- END MDE LIVE LOGIC ---
+
+  if ($script:ForceSense -ne 'Auto') {
+    if ($script:ForceSense -eq 'True') { 
+      $isSensePresent = $true; $status = 'Running' 
+    } else { 
+      $isSensePresent = $false; $status = 'Stopped' 
+    }
+  }
+
+  if ($script:ForceOnboarded -ne 'Auto') {
+    $isOnboarded = (Convert-ToBool $script:ForceOnboarded)
+  }
+  # --- END MDE TEST OVERRIDE LOGIC ---
 
   [pscustomobject]@{ SensePresent=$isSensePresent; SenseStatus=$status; Onboarded=$isOnboarded;
     IsBusiness=($isSensePresent -and ($status -eq 'Running' -or $status -eq 'StartPending') -and $isOnboarded) }
@@ -258,11 +300,41 @@ if($VendorFilter -and $VendorFilter.Count -gt 0){
   if($svcs){ $svcs=@($svcs | Where-Object { $n=$_.DisplayName + ' ' + $_.Name; foreach($f in $VendorFilter){ if($n -match $f){ return $true } } ; return $false }) }
 }
 
+# Test mode: inject fake vendor
+if ($ForceVendorPresent -and -not [string]::IsNullOrWhiteSpace($ForceVendor)) {
+  $products += [pscustomobject]@{ DisplayName=$ForceVendor; ProductStateRaw='0x61100'; RealTime=$true; SigUpToDate=$true; ProductExe="$ForceVendor.exe"; Timestamp=(Get-Date).ToString('r'); IsStale=$false }
+  if (-not $svcs) { $svcs=@() }
+  $svcs += [pscustomobject]@{ Name=($ForceVendor -replace '\s+','') + 'Svc'; DisplayName="$ForceVendor Engine"; Status=$ForceVendorServiceStatus; StartType='Automatic' }
+  if ($ForceClassification -eq 'Auto') { $activeThird = $products | Where-Object { $_.DisplayName -eq $ForceVendor } | Select-Object -First 1 }
+}
+
 $mde=Get-MDE; 
 $def=Get-Defender
 $third=@(); $heuristicUsed=$false
 if(-not $Strict){ $third=Get-ThirdPartyRTHeuristic -Products $products -Services $svcs }
 
+# --- New Force Active AV Vendor Logic ---
+if (-not [string]::IsNullOrWhiteSpace($ForceActiveAVVendor)) {
+    Write-Host "⚠️ [TEST MODE] Forcing classification to 3rd-party AV: '$ForceActiveAVVendor'"
+    
+    # 1. Force the classification type
+    $ForceClassification = 'ThirdParty' 
+    
+    # 2. Spoof a placeholder product object for the evaluation logic to use
+    $activeThird = [pscustomobject]@{
+        DisplayName = $ForceActiveAVVendor; 
+        RealTime = $true; 
+        ProductStateRaw = '0x0000'
+    }
+    $confidence='Forced'
+    $label='Other 3rd-party AV'
+    
+    # 3. SPOOF DEFENDER OFF/PASSIVE
+    $def.PassiveMode = $true
+    $def.RealTimeProtectionEnabled = $false
+    Write-Host "⚠️ [TEST MODE] Forced Defender to PassiveMode=True and RealTimeProtectionEnabled=False."
+}
+# --- End New Force Active AV Vendor Logic ---
 
 # --- Classification Logic ---
 $label=$null; $confidence='Low'
@@ -279,7 +351,7 @@ if(-not $label -and -not $Strict -and $third){
     $confidence='Medium'; $heuristicUsed=$true; if(-not $activeThird){ $activeThird = $products | Where-Object { $_.DisplayName -match [regex]::Escape($inf.Vendor) } | Select-Object -First 1 } }
 }
 if(-not $label){ $label='No active AV'; $confidence='Low' }
-# Removed $ForceClassification override for production
+if($ForceClassification -ne 'Auto'){ switch($ForceClassification){'Bitdefender'{$label='N-able Managed AV (Bitdefender)'}'ThirdParty'{$label='Other 3rd-party AV'}'DefenderBusiness'{$label='Defender - Business'}'DefenderConsumer'{$label='Defender - Consumer'}'None'{$label='No active AV'}}; $confidence='Forced' }
 $bitdef=$null; if($label -eq 'N-able Managed AV (Bitdefender)'){ $bitdef=Get-BitdefenderInfo }
 
 # ----------------------------- EVALUATION -----------------------------
@@ -296,17 +368,52 @@ $defenderActive = ($label -like 'Defender*')
 $defSigFresh=$false
 if($def.AVSignatureVersion -and $def.AVSignatureVersion -notmatch '^0(\.0){3}$' -and $null -ne $def.SigAgeHours){ $defSigFresh = ($def.SigAgeHours -le [double]$SigFreshHours) }
 
+# >>> NEW LOGIC: Override Signature Freshness <<<
+if ($ForceSigFresh -ne 'Auto') {
+    $defSigFresh = (Convert-ToBool $ForceSigFresh)
+    Write-Host "⚠️ [TEST MODE] Forced \$defSigFresh to: $defSigFresh"
+}
+# >>> END NEW LOGIC <<<
+
+# >>> NEW LOGIC: Override Scan Checks and Inject Dates if needed (FIXED) <<<
+$scansCurrent = $true
+if ($ForceScansCurrent -ne 'Auto') {
+    $scansCurrent = (Convert-ToBool $ForceScansCurrent)
+    Write-Host "⚠️ [TEST MODE] Forced scan checks to: $scansCurrent"
+
+    if ($scansCurrent -eq $false) {
+        # If the user forces a failure AND the scan dates are null, inject old dates 
+        # that are guaranteed to fail the threshold checks.
+        if (-not $def.LastQuickScan) {
+            $def.LastQuickScan = (Get-Date).AddDays(-100)
+            Write-Host "⚠️ [TEST MODE] Injected old LastQuickScan date."
+        }
+        if (-not $def.LastFullScan) {
+            $def.LastFullScan = (Get-Date).AddDays(-100)
+            Write-Host "⚠️ [TEST MODE] Injected old LastFullScan date."
+        }
+    }
+}
+# >>> END NEW LOGIC <<<
+
 if($defenderActive){
   if($def.ServiceStatus -ne 'Running'){ Add-Issue 'Defender service not running' 'Critical' }
   if(($RequireRealTime -or $true) -and -not $def.RealTimeProtectionEnabled){ Add-Issue 'Defender real-time protection is OFF' 'Critical' }
   
-  # Check 1: Signature Freshness
+  # Check 1: Signature Freshness (Uses $defSigFresh variable which can be forced)
   if(-not $defSigFresh -and $def.AVSignatureVersion){ Add-Issue ("Defender signatures are stale (> {0}h)" -f $SigFreshHours) 'Warning' }
   
-  # Check 2 & 3: Scan Age (Standard Logic Only)
-  if($def.LastQuickScan){ $qsAge=([datetime]::UtcNow - [datetime]$def.LastQuickScan).TotalDays; if($qsAge -gt $MaxQuickScanAgeDays){ Add-Issue ("Last quick scan older than {0} days" -f $MaxQuickScanAgeDays) 'Warning' } }
-  if($def.LastFullScan){  $fsAge=([datetime]::UtcNow - [datetime]$def.LastFullScan).TotalDays; if($fsAge -gt $MaxFullScanAgeDays){ Add-Issue ("Last full scan older than {0} days" -f $MaxFullScanAgeDays) 'Warning' } }
-  
+  # Check 2 & 3: Scan Age (Only perform/report if not forcefully successful)
+  if ($scansCurrent -eq $false) {
+    # If forced false, these inner checks will now run against the injected (old) dates
+    if($def.LastQuickScan){ $qsAge=([datetime]::UtcNow - [datetime]$def.LastQuickScan).TotalDays; if($qsAge -gt $MaxQuickScanAgeDays){ Add-Issue ("Last quick scan older than {0} days" -f $MaxQuickScanAgeDays) 'Warning' } }
+    if($def.LastFullScan){  $fsAge=([datetime]::UtcNow - [datetime]$def.LastFullScan).TotalDays; if($fsAge -gt $MaxFullScanAgeDays){ Add-Issue ("Last full scan older than {0} days" -f $MaxFullScanAgeDays) 'Warning' } }
+  } else {
+    # Normal logic path: Check against actual thresholds if not being forced to fail
+    if($def.LastQuickScan){ $qsAge=([datetime]::UtcNow - [datetime]$def.LastQuickScan).TotalDays; if($qsAge -gt $MaxQuickScanAgeDays){ Add-Issue ("Last quick scan older than {0} days" -f $MaxQuickScanAgeDays) 'Warning' } }
+    if($def.LastFullScan){  $fsAge=([datetime]::UtcNow - [datetime]$def.LastFullScan).TotalDays; if($fsAge -gt $MaxFullScanAgeDays){ Add-Issue ("Last full scan older than {0} days" -f $MaxFullScanAgeDays) 'Warning' } }
+  }
+
   if($def.PassiveMode){ Add-Issue 'Defender is in Passive Mode (subordinate to another AV)' 'Warning' }
 }
 
@@ -351,15 +458,22 @@ elseif ($label -eq 'N-able Managed AV (Bitdefender)') {
 elseif ($label -eq 'Other 3rd-party AV' -and $activeThird) {
   $vendorName = $activeThird.DisplayName
   $svcStatus  = Get-VendorServiceStatus -VendorName $vendorName -Services $svcs
-  
-  if ($svcStatus -ne 'Unknown') {
+  # If we forced the AV vendor, assume a running status for simplicity in call checks
+  if ($ForceActiveAVVendor) {
+      $svcName = $ForceActiveAVVendor
+      $svcStatus = 'Running (Spoofed)'
+      $avSvc = "{0}: {1}" -f $svcName, $svcStatus
+  } 
+  elseif ($svcStatus -ne 'Unknown') {
     $svcObj = $svcs | Where-Object { $_.DisplayName -match [regex]::Escape($vendorName) -or $_.Name -match ($vendorName -replace '\s+','') } | Select-Object -First 1
     $svcName = if ($svcObj) { $svcObj.DisplayName } else { $vendorName }
     $avSvc   = "{0}: {1}" -f $svcName, $svcStatus  
   }
 }
 
-$mdeLine = if($mde.Onboarded){ "Onboarded (Sense=$($mde.SenseStatus))" } else { "Not onboarded" }
+# Add TestMode Note to MDE line if testing is active
+$mdeNote = if ($TestMDE) { ' (TEST MODE)' } else { '' }
+$mdeLine = if($mde.Onboarded){ "Onboarded (Sense=$($mde.SenseStatus))$mdeNote" } else { "Not onboarded$mdeNote" }
 
 $script:elapsedTime = ((Get-Date) - $script:startTime).TotalSeconds
 $result=[pscustomobject]@{
@@ -372,8 +486,12 @@ $result=[pscustomobject]@{
   Parameters=[pscustomobject]@{ 
     StaleHours=$StaleHours; SigFreshHours=$SigFreshHours; MaxQuickScanAgeDays=$MaxQuickScanAgeDays; MaxFullScanAgeDays=$MaxFullScanAgeDays;
     RequireRealTime=[bool]$RequireRealTime; RequireMDE=[bool]$RequireMDE; Strict=[bool]$Strict
-    HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
-    VendorFilter=$VendorFilter
+    ForceClassification=$ForceClassification; ForceSigUpToDate=$ForceSigUpToDate; ForceSense=$ForceSense; HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
+    ForceVendor=$ForceVendor; ForceVendorPresent=[bool]$ForceVendorPresent; ForceVendorServiceStatus=$ForceVendorServiceStatus;
+    ForceActiveAVVendor=$ForceActiveAVVendor;
+    ForceSigFresh=$ForceSigFresh;
+    ForceScansCurrent=$ForceScansCurrent;
+    TestMDE=[bool]$TestMDE; ForceOnboarded=$ForceOnboarded 
   }
 }
 
@@ -413,6 +531,16 @@ if($AsJson){
   Write-Host "`n--- Parameters & Thresholds ---"
   Write-Host ("  SigFreshHours:{0} MaxQuickScanAgeDays:{1} MaxFullScanAgeDays:{2}" -f $SigFreshHours, $MaxQuickScanAgeDays, $MaxFullScanAgeDays)
   Write-Host ("  RequireRealTime:{0} RequireMDE:{1} Strict:{2}" -f ([bool]$RequireRealTime), ([bool]$RequireMDE), ([bool]$Strict))
+  if ($TestMDE) { 
+      Write-Host "  !!! MDE Testing Active: TestMDE=True !!!" 
+      Write-Host "  ForceSense: {0} ForceOnboarded: {1}" -f $ForceSense, $ForceOnboarded
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ForceActiveAVVendor)) {
+      Write-Host "  !!! AV Testing Active: ForceActiveAVVendor='{0}' !!!" -f $ForceActiveAVVendor
+  }
+  if ($ForceSigFresh -ne 'Auto' -or $ForceScansCurrent -ne 'Auto') {
+      Write-Host "  !!! THRESHOLD Testing Active: SigFresh='{0}' ScansCurrent='{1}' !!!" -f $ForceSigFresh, $ForceScansCurrent
+  }
 }
 
 # ----------------------------- Exit codes -----------------------------
