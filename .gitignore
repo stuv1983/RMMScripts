@@ -1,0 +1,47 @@
+# ------------------------------------
+# General Files to Ignore
+# ------------------------------------
+
+# Temporary Files
+[Tt]humb{s,nail}s.db
+*.bak
+*.tmp
+*~
+
+# Log and Diagnostic Files
+*.log
+*.err
+*.dmp
+*.stackdump
+
+# macOS
+.DS_Store
+
+# Windows Files
+desktop.ini
+$RECYCLE.BIN/
+
+# ------------------------------------
+# PowerShell/Scripting Files
+# ------------------------------------
+
+# Compiled files (PowerShell modules/assemblies)
+*.dll
+*.exe
+
+# PowerShell output/history files
+*.ps1xml
+$PSVersionTable
+*History.txt
+
+# Specific files to exclude (Per User Request)
+AutoWindows(old).ps1
+
+# Common IDE/Editor Configuration
+.vscode/
+.idea/
+
+# Binaries/Packages (if you used a package manager like npm or dotnet)
+bin/
+obj/
+node_modules/
