@@ -1,18 +1,15 @@
 <#
-## Version: 2025-11-08 NonAdmin/AMP-friendly v1.3 (Admin Check Removed)
 .SYNOPSIS
-    Windows Update helper for RMM use (N-able AMP/Automation Manager, etc.).
-    Accepts "true"/"false" strings from RMM as well as PowerShell booleans.
+    Windows Update helper for RMM use. Clean non-admin version.
 
 .DESCRIPTION
-    - Designed to work with RMMs that pass parameters as strings ("true"/"false").
+    - Designed for RMMs passing parameters as strings ("true"/"false").
+    - REMOVED: All calls to Start-Service and explicit service checks to allow for non-elevated scans.
     - Two modes:
-        * CheckOnly: scan and report available updates, do not download/install.
-        * Install  : scan, download, install updates. Optional AutoReboot.
+        * CheckOnly: Scans for available updates. Designed to work without Admin rights.
+        * Install  : Scans, downloads, and installs updates. REQUIRES Admin rights (will fail without them).
     - Prints clear RESULT lines for dashboards/ticket notes.
-    - Returns exit codes for policy/alert handling (see Exit Codes).
-    - Verbose output toggled using -VerboseOutput true|false.
-    - NOTE: While CheckOnly mode may work without elevation, Install mode typically REQUIRES admin rights.
+    - Returns standard exit codes for policy/alert handling (see Exit Codes).
 
 .PARAMETER CheckOnly
     String/Boolean. If true, only performs a scan and reports findings. Mutually exclusive with -Install.
@@ -21,7 +18,7 @@
     String/Boolean. If true, scans and installs updates. Mutually exclusive with -CheckOnly.
 
 .PARAMETER AutoReboot
-    String/Boolean. If true (and Install is true), the script will reboot automatically when required.
+    String/Boolean. If true (and Install is true), the script will reboot automatically when required (Requires Admin).
 
 .PARAMETER VerboseOutput
     String/Boolean. If true, enables detailed progress messages (Write-Verbose).
@@ -32,13 +29,7 @@
     2  - Success. Reboot required (either pending prior to run or required after install).
     10 - CheckOnly: updates available.
     11 - CheckOnly: reboot pending (detected before scan).
-    20 - Core services failed to start (BITS/WUAUSERV/CRYPTSVC).
-    40 - Windows Update failure (exception thrown).
-
-.EXAMPLES
-    .\AutoWindowsUpdate.ps1 -CheckOnly true -VerboseOutput true
-    .\AutoWindowsUpdate.ps1 -Install true -VerboseOutput true
-    .\AutoWindowsUpdate.ps1 -Install true -AutoReboot true -VerboseOutput true
+    40 - Windows Update failure (exception thrown, e.g., missing Admin rights, network/proxy error).
 #>
 
 [CmdletBinding()]
@@ -55,22 +46,20 @@ function Convert-ToBool {
     <#
     .SYNOPSIS
         Converts RMM-provided parameter values to [bool].
-    .DESCRIPTION
-        Accepts $null, [bool], numbers, or strings such as "true"/"false", "1"/"0".
-    .PARAMETER Value
-        Input value to convert.
     .OUTPUTS
         [bool]
     #>
     param([Parameter(ValueFromPipeline)][AllowNull()][object]$Value)
     process {
+        # Return false if value is null
         if ($null -eq $Value) { return $false }
+        # Return value directly if it is already a Boolean type
         if ($Value -is [bool]) { return $Value }
         # Numbers: treat non-zero as true
         if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
             return [bool]([int]$Value)
         }
-        # Strings: normalize
+        # Strings: normalize and convert
         $v = "$Value".Trim().ToLowerInvariant()
         switch ($v) {
             'true'  { return $true }
@@ -82,17 +71,20 @@ function Convert-ToBool {
     }
 }
 
+# Apply conversion to all input parameters
 $CheckOnly     = Convert-ToBool $CheckOnly
 $Install       = Convert-ToBool $Install
 $AutoReboot    = Convert-ToBool $AutoReboot
 $VerboseOutput = Convert-ToBool $VerboseOutput
 
-# Normalise verbose preference (no need to use -Verbose switch)
+# Normalise verbose preference based on input parameter
 $VerbosePreference = if ($VerboseOutput) { 'Continue' } else { 'SilentlyContinue' }
 
 # --- Safety / sanity checks ----------------------------------------------------
+
 # Mutually exclusive mode validation
 if ($CheckOnly -and $Install) {
+    # Terminate script if contradictory parameters are used
     throw "Choose one mode only: set either -CheckOnly true OR -Install true (not both)."
 }
 
@@ -102,7 +94,7 @@ if (-not $CheckOnly -and -not $Install) {
     $Install = $true
 }
 
-# AutoReboot is irrelevant when only checking
+# AutoReboot is irrelevant when only checking, so force it to false in CheckOnly mode
 if ($CheckOnly -and $AutoReboot) {
     Write-Verbose "Ignoring -AutoReboot because -CheckOnly true was selected."
     $AutoReboot = $false
@@ -120,16 +112,17 @@ function Get-PendingReboot {
     try {
         $pending = $false
 
-        # Component Based Servicing
+        # Check: Component Based Servicing (CBS) queue for Windows updates/installs
         $keyCBS = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         if (Test-Path $keyCBS) { $pending = $true }
 
-        # Windows Update Auto Update reboot required
+        # Check: Windows Update Auto Update service requirement
         $keyWUAU = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
         if (Test-Path $keyWUAU) { $pending = $true }
 
-        # PendingFileRenameOperations
+        # Check: PendingFileRenameOperations (used by MSI/installers)
         $keyPFRO = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+        # The next line might require Admin access if 'PendingFileRenameOperations' is present
         $valPFRO = (Get-ItemProperty -Path $keyPFRO -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
         if ($valPFRO) { $pending = $true }
 
@@ -140,118 +133,44 @@ function Get-PendingReboot {
     }
 }
 
-function Start-RequiredService {
-    <#
-    .SYNOPSIS
-        Ensures a service is running; attempts to start if stopped.
-    .PARAMETER Name
-        Service name (not display name), e.g., 'bits'.
-    .OUTPUTS
-        [bool] True if service is running at end of function; False otherwise.
-    #>
-    param([Parameter(Mandatory)][string]$Name)
-
-    try {
-        $svc = Get-Service -Name $Name -ErrorAction Stop
-
-        if ($svc.Status -ne 'Running') {
-            Write-Verbose "Starting service: $Name"
-            Start-Service -Name $Name -ErrorAction Stop
-
-            # Wait briefly to confirm it is running
-            for ($i = 0; $i -lt 20; $i++) {
-                $svc.Refresh()
-                if ($svc.Status -eq 'Running') { break }
-                Start-Sleep -Seconds 1
-            }
-        }
-
-        # Refresh and confirm
-        $svc.Refresh()
-        if ($svc.Status -ne 'Running') {
-            Write-Host "Service check failed for ${Name}: status is $($svc.Status)"
-            return $false
-        }
-        return $true
-    } catch {
-        Write-Host "Service check failed for ${Name}: $($_.Exception.Message)"
-        return $false
-    }
-}
-
-function Ensure-CoreServices {
-    <#
-    .SYNOPSIS
-        Ensures core update services are available.
-    .DESCRIPTION
-        - In Install mode: attempts to start and ENFORCES running state for BITS/WUAUSERV/CRYPTSVC.
-        - In CheckOnly mode: reports status and CONTINUES without enforcing (no exit).
-    .PARAMETER Enforce
-        [bool] If true, enforce and return $false on any failure; if false, do not enforce.
-    .OUTPUTS
-        [bool] True if services are OK (or not enforced); False only when Enforce=$true and a start/check fails.
-    #>
-    param([bool]$Enforce)
-
-    $ok = $true
-    foreach ($svc in @('bits','wuauserv','cryptsvc')) {
-        try {
-            $s = Get-Service -Name $svc -ErrorAction Stop
-            if ($Enforce) {
-                # Attempt to start service (requires Admin rights)
-                if (-not (Start-RequiredService -Name $svc)) { $ok = $false }
-            } else {
-                # Non-enforcing: just report status if not running
-                if ($s.Status -ne 'Running') {
-                    Write-Verbose "Service $svc is not running (non-enforced mode). Proceeding with best-effort scan."
-                }
-            }
-        } catch {
-            if ($Enforce) {
-                Write-Host "Service check failed for ${svc}: $($_.Exception.Message)"
-                $ok = $false
-            } else {
-                Write-Verbose "Service $svc status query failed (best-effort scan will continue): $($_.Exception.Message)"
-            }
-        }
-    }
-    return $ok
-}
-
-
 function Invoke-WindowsUpdateScan {
     <#
     .SYNOPSIS
         Uses WUA COM API to scan for available software updates.
     .OUTPUTS
         [PSCustomObject] with properties:
-            - Updates       : IUpdateCollection (available updates)
-            - Count         : [int] number of updates
-            - Titles        : [string[]] update titles for easy display
+            - Updates : IUpdateCollection (available updates)
+            - Count   : [int] number of updates
+            - Titles  : [string[]] update titles for easy display
     #>
     try {
         Write-Verbose "Scanning for Windows updates... please wait"
-        # Note: New-Object -ComObject 'Microsoft.Update.Session' typically works without admin rights for scanning.
+        # Note: WUA COM object invocation handles starting BITS/WUAUSERV automatically (or fails if it cannot).
         $session   = New-Object -ComObject 'Microsoft.Update.Session'
         $searcher  = $session.CreateUpdateSearcher()
+        # Criteria: Not installed, not hidden, and a software type (excludes drivers by default)
         $criteria  = "IsInstalled=0 and IsHidden=0 and Type='Software'"
         Write-Verbose "WUA Criteria: $criteria"
 
+        # Perform the actual search operation
         $result    = $searcher.Search($criteria)
         Write-Verbose "[WUA Debug] Search ResultCode: $($result.ResultCode) (2=Succeeded)"
         $updates   = $result.Updates
 
+        # Extract titles for verbose output
         $titles = @()
         for ($i = 0; $i -lt $updates.Count; $i++) {
             $titles += $updates.Item($i).Title
         }
 
+        # Return structured data object
         return [PSCustomObject]@{
             Updates = $updates
             Count   = [int]$updates.Count
             Titles  = $titles
         }
     } catch {
+        # Catch network/COM/HRESULT errors (e.g., 0x8024402C or Access Denied if WUA fails to start services)
         throw "Windows Update scan failed: $($_.Exception.Message)"
     }
 }
@@ -283,14 +202,16 @@ function Install-WindowsUpdates {
 
         for ($i = 0; $i -lt $Updates.Count; $i++) {
             $u = $Updates.Item($i)
+            # Accept EULA if required, as installation will fail otherwise
             if ($u.EulaAccepted -eq $false) {
                 Write-Verbose "Accepting EULA for: $($u.Title)"
                 $u.AcceptEula()
             }
-            # Add to collection
+            # Add to the collection of updates to install
             [void]$toInstall.Add($u)
         }
 
+        # Safety check if collection somehow ended up empty
         if ($toInstall.Count -eq 0) {
             Write-Verbose "No eligible updates to install."
             return [PSCustomObject]@{
@@ -302,13 +223,13 @@ function Install-WindowsUpdates {
             }
         }
 
-        # Download
+        # --- Download Phase ---
         Write-Verbose "Downloading $($toInstall.Count) update(s)..."
         $downloader.Updates = $toInstall
         $dlResult = $downloader.Download()
         Write-Verbose "Download result: $($dlResult.ResultCode) (2=Succeeded)"
 
-        # Install
+        # --- Install Phase ---
         Write-Verbose "Installing updates..."
         $installer.Updates = $toInstall
         $inResult = $installer.Install()
@@ -322,9 +243,11 @@ function Install-WindowsUpdates {
         for ($i = 0; $i -lt $toInstall.Count; $i++) {
             $u = $toInstall.Item($i)
             $hr = $inResult.GetUpdateResult($i).HResult
+            # HResult 0 means success
             if ($hr -eq 0) { $succeeded += $u.Title } else { $failed += $u.Title }
         }
 
+        # Return structured results object
         return [PSCustomObject]@{
             DownloadResult = $dlResult.ResultCode
             InstallResult  = $inResult.ResultCode
@@ -333,19 +256,13 @@ function Install-WindowsUpdates {
             Failed         = $failed
         }
     } catch {
+        # Catch errors during COM operations (e.g., Access Denied if not elevated)
         throw "Windows Update install failed: $($_.Exception.Message)"
     }
 }
 
-# --- Core service pre-checks ---------------------------------------------------
-# In CheckOnly: best-effort (no enforcement). In Install: enforce services running (which requires Admin).
-$servicesOk = if ($CheckOnly) { Ensure-CoreServices -Enforce:$false } else { Ensure-CoreServices -Enforce:$true }
-if (-not $servicesOk -and -not $CheckOnly) {
-    Write-Host "RESULT: One or more core services failed to start. (Installation requires Administrator rights.)"
-    exit 20
-}
-
-# --- Initial reboot check (so RMM can see prior state) -------------------------
+# --- Initial reboot check ------------------------------------------------------
+# Perform an initial check for pending reboot status
 $rebootPendingBefore = Get-PendingReboot
 if ($rebootPendingBefore) {
     Write-Verbose "Reboot is pending before we start."
@@ -353,27 +270,34 @@ if ($rebootPendingBefore) {
 
 # --- Main flow -----------------------------------------------------------------
 try {
+    # 1. Invoke the WUA scan
     $scan = Invoke-WindowsUpdateScan
 
     if ($CheckOnly) {
         # Mode: CheckOnly
+        
+        # Check 1: If a reboot was already pending.
         if ($rebootPendingBefore) {
             Write-Verbose "Reboot pending detected. Exiting with code 11 if no updates are found, otherwise code 10."
-            # If a reboot is pending and there are no updates, exit with 11.
+            # If a reboot is pending AND there are no updates found, exit with code 11.
             if ($scan.Count -eq 0) {
                 Write-Host "RESULT: No updates found, but a reboot is pending."
                 exit 11
             }
         }
 
+        # Check 2: Report updates found (if scan count > 0) and exit with code 10.
         if ($scan.Count -gt 0) {
             Write-Host "RESULT: $($scan.Count) update(s) available."
             if ($VerboseOutput -and $scan.Titles.Count -gt 0) {
                 Write-Host "Available updates:"
+                # Output update titles in verbose mode
                 $scan.Titles | ForEach-Object { Write-Host " - $_" }
             }
             exit 10
-        } else {
+        } 
+        # Check 3: No updates found and no reboot pending, exit with code 0.
+        else {
             Write-Host "RESULT: No updates found."
             exit 0
         }
@@ -385,16 +309,20 @@ try {
 
         if ($scan.Count -gt 0) {
             Write-Verbose "Found $($scan.Count) update(s) to install."
+            # Perform the download and install operation
             $result = Install-WindowsUpdates -Updates $scan.Updates
+
             if ($result.Succeeded.Count -gt 0) {
                 $installedAnything = $true
                 Write-Host "RESULT: Installed $($result.Succeeded.Count) update(s)."
                 if ($VerboseOutput) {
                     Write-Host "Installed:"
+                    # Output successfully installed titles
                     $result.Succeeded | ForEach-Object { Write-Host " - $_" }
                 }
             }
             if ($result.Failed.Count -gt 0) {
+                # Installation failure likely indicates missing Admin rights or an environmental issue
                 Write-Warning "The following updates failed: (This often indicates missing Administrator rights.)"
                 $result.Failed | ForEach-Object { Write-Warning " - $_" }
             }
@@ -406,30 +334,36 @@ try {
             Write-Host "RESULT: No updates found to install."
         }
 
-        # Confirm reboot state after install
+        # Final check for reboot state after the installation phase
         if (-not $overallRebootNeeded) {
             $overallRebootNeeded = Get-PendingReboot
         }
 
-        # Reboot logic
+        # --- Final Reboot Logic and Exit Codes for Install Mode ---
         if ($overallRebootNeeded) {
             Write-Host "RESULT: Reboot required."
             if ($AutoReboot) {
+                # Initiate system reboot (requires Admin rights)
                 Write-Verbose "AutoReboot=true; initiating reboot in 60 seconds. (This command requires Administrator rights.)"
                 shutdown.exe /r /t 60 /c "Windows Updates installed. Reboot scheduled by AutoWindowsUpdate.ps1."
             }
+            # Exit with code 2: Reboot required
             exit 2
         } else {
             if ($installedAnything) {
+                # Exit with code 1: Updates installed, no reboot required
                 exit 1
             } else {
+                # Exit with code 0: Nothing was installed and no reboot is pending
                 exit 0
             }
         }
     }
 }
 catch {
+    # Global exception handler for COM/HRESULT errors
     Write-Error $_.Exception.Message
     Write-Host "RESULT: Windows Update failed."
+    # Exit with code 40: Generic script/Windows Update failure
     exit 40
 }

@@ -20,26 +20,19 @@ param(
   [Parameter()] [object]$AsJson,
 
   # ===== Behaviour toggles =====
-  [switch]$Strict,
-  [switch]$AssumeDefenderRTWhenServiceRunning = $true,
+  [Parameter()] [object]$Strict, 
+  [Parameter()] [object]$AssumeDefenderRTWhenServiceRunning = $true, 
 
   # ===== Thresholds & Requirements =====
   [int]$StaleHours = 72, 
   [int]$SigFreshHours = 48,
   [int]$MaxQuickScanAgeDays = 14, 
   [int]$MaxFullScanAgeDays = 30,
-  [switch]$RequireRealTime = $false, # Require Real-Time Protection to be on
-  [switch]$RequireMDE,               # Require MDE to be onboarded
+  [Parameter()] [object]$RequireRealTime = $false, 
+  [Parameter()] [object]$RequireMDE,               
 
-  # ===== Test/lab overrides (retained for testing complex AV states) =====
-  [string[]]$VendorFilter,
-  [ValidateSet('Auto','Bitdefender','ThirdParty','DefenderBusiness','DefenderConsumer','None')]
-  [string]$ForceClassification = 'Auto',
-  [ValidateSet('Auto','True','False')][string]$ForceSigUpToDate = 'Auto',
-  [ValidateSet('Auto','True','False')][string]$ForceSense = 'Auto',
-  [string]$ForceVendor = '', 
-  [switch]$ForceVendorPresent,
-  [ValidateSet('Running','Stopped','Unknown')][string]$ForceVendorServiceStatus = 'Running'
+  # ===== Filtering overrides (Only kept for production filtering needs) =====
+  [string[]]$VendorFilter
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -75,6 +68,12 @@ function BoolStr([bool]$b){ if($b){'True'}else{'False'} }
 # --- RMM Parameter Conversion ---
 $Full   = Convert-ToBool $Full
 $AsJson = Convert-ToBool $AsJson
+# Convert previously switch/boolean parameters to handle RMM string inputs
+$Strict = Convert-ToBool $Strict
+$AssumeDefenderRTWhenServiceRunning = Convert-ToBool $AssumeDefenderRTWhenServiceRunning
+$RequireRealTime = Convert-ToBool $RequireRealTime
+$RequireMDE = Convert-ToBool $RequireMDE
+
 
 # Check for minimum required PowerShell version (5.1 or later)
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -107,8 +106,15 @@ function Get-MDE { # MDE Sense + registry onboarding
   $status= if($svc){$svc.Status.ToString()}else{'NotPresent'}
   $onb=$false; $reg='HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status'
   if (Test-Path $reg){ $v=(Get-ItemProperty $reg -ErrorAction SilentlyContinue).OnboardingState; if($null -ne $v -and 1 -eq [int]$v){$onb=$true} }
-  [pscustomobject]@{ SensePresent=[bool]$svc; SenseStatus=$status; Onboarded=$onb;
-    IsBusiness=([bool]$svc -and ($status -eq 'Running' -or $status -eq 'StartPending') -and $onb) }
+  
+  # --- MDE LIVE LOGIC ---
+  $isSensePresent = [bool]$svc
+  $isSenseRunning = ($status -eq 'Running' -or $status -eq 'StartPending')
+  $isOnboarded    = $onb
+  # --- END MDE LIVE LOGIC ---
+
+  [pscustomobject]@{ SensePresent=$isSensePresent; SenseStatus=$status; Onboarded=$isOnboarded;
+    IsBusiness=($isSensePresent -and ($status -eq 'Running' -or $status -eq 'StartPending') -and $isOnboarded) }
 }
 
 function Get-Defender { # Defender cmdlets -> fallback to service/registry
@@ -252,18 +258,11 @@ if($VendorFilter -and $VendorFilter.Count -gt 0){
   if($svcs){ $svcs=@($svcs | Where-Object { $n=$_.DisplayName + ' ' + $_.Name; foreach($f in $VendorFilter){ if($n -match $f){ return $true } } ; return $false }) }
 }
 
-# Test mode: inject fake vendor
-if ($ForceVendorPresent -and -not [string]::IsNullOrWhiteSpace($ForceVendor)) {
-  $products += [pscustomobject]@{ DisplayName=$ForceVendor; ProductStateRaw='0x61100'; RealTime=$true; SigUpToDate=$true; ProductExe="$ForceVendor.exe"; Timestamp=(Get-Date).ToString('r'); IsStale=$false }
-  if (-not $svcs) { $svcs=@() }
-  $svcs += [pscustomobject]@{ Name=($ForceVendor -replace '\s+','') + 'Svc'; DisplayName="$ForceVendor Engine"; Status=$ForceVendorServiceStatus; StartType='Automatic' }
-  if ($ForceClassification -eq 'Auto') { $activeThird = $products | Where-Object { $_.DisplayName -eq $ForceVendor } | Select-Object -First 1 }
-}
-
 $mde=Get-MDE; 
 $def=Get-Defender
 $third=@(); $heuristicUsed=$false
 if(-not $Strict){ $third=Get-ThirdPartyRTHeuristic -Products $products -Services $svcs }
+
 
 # --- Classification Logic ---
 $label=$null; $confidence='Low'
@@ -280,7 +279,7 @@ if(-not $label -and -not $Strict -and $third){
     $confidence='Medium'; $heuristicUsed=$true; if(-not $activeThird){ $activeThird = $products | Where-Object { $_.DisplayName -match [regex]::Escape($inf.Vendor) } | Select-Object -First 1 } }
 }
 if(-not $label){ $label='No active AV'; $confidence='Low' }
-if($ForceClassification -ne 'Auto'){ switch($ForceClassification){'Bitdefender'{$label='N-able Managed AV (Bitdefender)'}'ThirdParty'{$label='Other 3rd-party AV'}'DefenderBusiness'{$label='Defender - Business'}'DefenderConsumer'{$label='Defender - Consumer'}'None'{$label='No active AV'}}; $confidence='Forced' }
+# Removed $ForceClassification override for production
 $bitdef=$null; if($label -eq 'N-able Managed AV (Bitdefender)'){ $bitdef=Get-BitdefenderInfo }
 
 # ----------------------------- EVALUATION -----------------------------
@@ -300,9 +299,14 @@ if($def.AVSignatureVersion -and $def.AVSignatureVersion -notmatch '^0(\.0){3}$' 
 if($defenderActive){
   if($def.ServiceStatus -ne 'Running'){ Add-Issue 'Defender service not running' 'Critical' }
   if(($RequireRealTime -or $true) -and -not $def.RealTimeProtectionEnabled){ Add-Issue 'Defender real-time protection is OFF' 'Critical' }
+  
+  # Check 1: Signature Freshness
   if(-not $defSigFresh -and $def.AVSignatureVersion){ Add-Issue ("Defender signatures are stale (> {0}h)" -f $SigFreshHours) 'Warning' }
+  
+  # Check 2 & 3: Scan Age (Standard Logic Only)
   if($def.LastQuickScan){ $qsAge=([datetime]::UtcNow - [datetime]$def.LastQuickScan).TotalDays; if($qsAge -gt $MaxQuickScanAgeDays){ Add-Issue ("Last quick scan older than {0} days" -f $MaxQuickScanAgeDays) 'Warning' } }
   if($def.LastFullScan){  $fsAge=([datetime]::UtcNow - [datetime]$def.LastFullScan).TotalDays; if($fsAge -gt $MaxFullScanAgeDays){ Add-Issue ("Last full scan older than {0} days" -f $MaxFullScanAgeDays) 'Warning' } }
+  
   if($def.PassiveMode){ Add-Issue 'Defender is in Passive Mode (subordinate to another AV)' 'Warning' }
 }
 
@@ -347,6 +351,7 @@ elseif ($label -eq 'N-able Managed AV (Bitdefender)') {
 elseif ($label -eq 'Other 3rd-party AV' -and $activeThird) {
   $vendorName = $activeThird.DisplayName
   $svcStatus  = Get-VendorServiceStatus -VendorName $vendorName -Services $svcs
+  
   if ($svcStatus -ne 'Unknown') {
     $svcObj = $svcs | Where-Object { $_.DisplayName -match [regex]::Escape($vendorName) -or $_.Name -match ($vendorName -replace '\s+','') } | Select-Object -First 1
     $svcName = if ($svcObj) { $svcObj.DisplayName } else { $vendorName }
@@ -367,8 +372,9 @@ $result=[pscustomobject]@{
   Parameters=[pscustomobject]@{ 
     StaleHours=$StaleHours; SigFreshHours=$SigFreshHours; MaxQuickScanAgeDays=$MaxQuickScanAgeDays; MaxFullScanAgeDays=$MaxFullScanAgeDays;
     RequireRealTime=[bool]$RequireRealTime; RequireMDE=[bool]$RequireMDE; Strict=[bool]$Strict
-    ForceClassification=$ForceClassification; ForceSigUpToDate=$ForceSigUpToDate; ForceSense=$ForceSense; HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
-    ForceVendor=$ForceVendor; ForceVendorPresent=[bool]$ForceVendorPresent; ForceVendorServiceStatus=$ForceVendorServiceStatus }
+    HeuristicUsed=$heuristicUsed; AssumeDefenderRTWhenServiceRunning=[bool]$AssumeDefenderRTWhenServiceRunning
+    VendorFilter=$VendorFilter
+  }
 }
 
 # ----------------------------- OUTPUT -----------------------------
