@@ -1,7 +1,6 @@
 # NoC Script Collection
 
-> ⚠️ **Disclaimer**  
-> Run at your own risk. Test thoroughly in a lab first. The author is not responsible for any damage, data loss, or unexpected outcomes.
+> ⚠️ **Disclaimer** > Run at your own risk. Test thoroughly in a lab first. The author is not responsible for any damage, data loss, or unexpected outcomes.
 
 ## Main Overview
 A collection of **PowerShell scripts** for **NOC / MSP** environments to automate endpoint health checks, patching, and upgrade readiness.  
@@ -11,8 +10,9 @@ All scripts are **RMM‑friendly** (clear console output + exit codes) and safe 
 
 ## 📦 Scripts in this Repo
 - **SecurityCheck.ps1** – Endpoint security posture in one pass (AV/Firewall/Updates/Reboot).  
-- **AutoWindowsUpdate.ps1** – *Basic* Windows Update checker/installer (this section expanded below).  
-- **HDDUsageCheck.ps1** – Ligh weight script to check what is using data on C: 
+- **AutoWindowsUpdate.ps1** – *Basic* Windows Update checker/installer.  
+- **Update-Chrome.ps1** – Updates Google Chrome via Winget with "Pending Reboot" detection.
+- **HDDUsageCheck.ps1** – Lightweight script to check what is using data on C: 
 
 ---
 
@@ -53,8 +53,6 @@ A lightweight script that **checks for pending Windows Updates** and can **insta
 | ✅ **Auto Reboot Option** | `-AutoReboot` triggers restart if updates require it. |
 | ✅ **RMM-Friendly** | Uses clear, parseable console output and standard exit codes. |
 | ❌ **No Windows 10 to 11 upgrade** | This will NOT upgrade a device from Windows 10 to 11. |
----
-
 
 ### Parameters
 | Parameter | Purpose |
@@ -77,32 +75,41 @@ A lightweight script that **checks for pending Windows Updates** and can **insta
 .\AutoWindowsUpdate.ps1 -Install -Reboot
 ```
 
-### Sample Output
-```
-=== Starting Windows Update Script ===
-PSWindowsUpdate module not found — attempting to install...
-✅ PSWindowsUpdate module installed successfully.
+---
 
-=== Checking for available updates... ===
-Title                                                     KBArticleIDs   Size
------                                                     ------------   ----
-2025-11 Cumulative Update for Windows 11 Version 24H2     KB5067036      645 MB
-Microsoft .NET Framework 4.8.1 Security Update            KB5031183      125 MB
+# Update-Chrome.ps1
 
-⚙️  Updates are available.
+### Overview
+Updates Google Chrome using **Winget** (Windows Package Manager).  
+Crucially, it handles the "Pending Reboot" scenario where Chrome has staged an update but the user hasn't relaunched the browser yet.
 
-=== Installing available updates... ===
-... (download/install progress) ...
-✅ Update installation completed.
+### Key Features
+| Feature | Description |
+|---|---|
+| ✅ **Smart Detection** | Checks if Chrome is running and skips the update to avoid disrupting the user. |
+| ✅ **Pending Reboot Aware** | Compares the version in memory vs. the registry. If a reboot is pending, it reports the *staged* version. |
+| ✅ **Exit Codes** | Returns `0` (Success) even if skipped, keeping RMM dashboards green. |
+| ✅ **Force Mode** | Configurable variable to force-kill Chrome if aggressive patching is required. |
 
-=== Checking if reboot is required... ===
-🔁 Reboot required. Restarting system now...
+### Logic Flow
+1. **Process Check:** Is `chrome.exe` running?
+   - **No:** Run `winget upgrade Google.Chrome`.
+   - **Yes:** Check Registry for pending update flag.
+2. **Pending Reboot Check:**
+   - If Registry Version > Running Version → **Report "Pending Relaunch"** (Skip update).
+3. **Winget Check:**
+   - If no reboot pending, check Winget for new download.
+   - If available version > running version → **Report "Update Available"** (Skip update to save session).
+
+### Example Output (Log)
+```text
+ [!] PENDING REBOOT DETECTED
+     Running Version:   120.0.6099.109
+     Staged Version:    120.0.6099.130
+     Action: Skipped. Chrome needs a relaunch to finish update to 120.0.6099.130.
 ```
 
 ---
-
-
-
 
 # HDDUsageCheck.ps1
 
@@ -136,11 +143,11 @@ It is ideal for use in managed environments (e.g., NOC/RMM) to identify space-he
 Drive C:: Total=475.68 GB | Used=420.12 GB | Free=55.56 GB (11.7% free)
 
 === User Profile Space Usage (C:\Users) ===
-User       Path                SizeGB
-----       ----                ------
-stuar      C:\Users\stuar     45.12
+User        Path                 SizeGB
+----        ----                 ------
+stuar       C:\Users\stuar       45.12
 WsiAccount C:\Users\WsiAccount 0
-cordw      C:\Users\cordw      0
+cordw       C:\Users\cordw       0
 
 --- stuar (C:\Users\stuar) ---
 Large items (≥ 5 GB):
@@ -162,7 +169,7 @@ File Outlook.ost 12.34 GB C:\Users\stuar\AppData\Local\Microsoft\Outlook\Outlook
 ## Versioning and Maintenance
 ```bash
 git add .
-git commit -m "Update README; document basic AutoWindowsUpdate.ps1 usage and output"
+git commit -m "Update README; add Chrome Update documentation"
 git push
 ```
 
