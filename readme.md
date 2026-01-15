@@ -1,6 +1,7 @@
 # NoC Script Collection
 
-> ⚠️ **Disclaimer** > Run at your own risk. Test thoroughly in a lab first. The author is not responsible for any damage, data loss, or unexpected outcomes.
+> ⚠️ **Disclaimer**  
+> Run at your own risk. Test thoroughly in a lab first. The author is not responsible for any damage, data loss, or unexpected outcomes.
 
 ## Main Overview
 A collection of **PowerShell scripts** for **NOC / MSP** environments to automate endpoint health checks, patching, and upgrade readiness.  
@@ -9,10 +10,75 @@ All scripts are **RMM‑friendly** (clear console output + exit codes) and safe 
 ---
 
 ## 📦 Scripts in this Repo
+- **AVCheck.ps1** – Focused antivirus & Defender posture check (Defender + 3rd‑party aware).
 - **SecurityCheck.ps1** – Endpoint security posture in one pass (AV/Firewall/Updates/Reboot).  
 - **AutoWindowsUpdate.ps1** – *Basic* Windows Update checker/installer.  
 - **Update-Chrome.ps1** – Updates Google Chrome via Winget with "Pending Reboot" detection.
 - **HDDUsageCheck.ps1** – Lightweight script to check what is using data on C: 
+
+---
+
+# AVCheck.ps1
+
+## Overview
+**AVCheck.ps1** performs a **dedicated antivirus posture check** optimised for MSP/NOC monitoring.  
+It validates **installed AV products**, **real‑time protection state**, **Microsoft Defender health**, **signature currency**, and **Defender for Endpoint (MDE)** onboarding.
+
+This script is intentionally narrower than `SecurityCheck.ps1` and is ideal for:
+- Antivirus‑only monitors
+- High‑frequency health checks
+- Replacing unreliable built‑in RMM AV checks (e.g., Defender excluded/misclassified)
+
+---
+
+## What It Checks
+| Area | Description |
+|---|---|
+| **Installed AV** | Enumerates AV products via Windows Security Center (WSC) |
+| **Active / Real‑Time AV** | Confirms which AV engine has real‑time protection enabled |
+| **Defender Health** | Service state, real‑time protection, engine & platform versions |
+| **Signature Currency** | Flags stale Defender signatures (configurable threshold) |
+| **MDE (Sense)** | Detects Defender for Endpoint onboarding via Sense service |
+| **AV Conflicts** | Detects multiple real‑time AV engines enabled simultaneously |
+
+---
+
+## Parameters
+| Parameter | Purpose |
+|---|---|
+| `-RequireRealTime` | Fail if **no real‑time AV** is enabled |
+| `-RequireMDE` | Warn/Fail if **MDE is not onboarded** |
+| `-SigFreshHours` | Max allowed Defender signature age (default: 48h) |
+| `-Full` | Detailed multi‑line output (ticket notes) |
+| `-AsJson` | Structured JSON output for ingestion |
+| `-DebugMode` | Extra diagnostics for troubleshooting templates/parsing |
+
+---
+
+## Examples
+```powershell
+# Default (summary line for dashboards/monitors)
+.\AVCheck.ps1
+
+# Enforce real-time AV + MDE onboarding
+.\AVCheck.ps1 -RequireRealTime -RequireMDE
+
+# Detailed output for ticket notes
+.\AVCheck.ps1 -Full
+
+# Structured output for ingestion/parsing
+.\AVCheck.ps1 -AsJson
+```
+
+---
+
+## Exit Codes
+| Code | Meaning |
+|---|---|
+| `0` | OK / Secure |
+| `1` | Warning (stale signatures/scans, soft posture issues) |
+| `2` | Critical (no real‑time AV, AV conflicts, required control missing) |
+| `4` | Script error |
 
 ---
 
