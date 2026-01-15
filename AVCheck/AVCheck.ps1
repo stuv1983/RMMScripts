@@ -1,128 +1,143 @@
-<# 
+<#
 .SYNOPSIS
-  AVCheck.ps1 — Endpoint Antivirus and MDE security posture check (PowerShell 5.1+).
+  AVCheck.ps1 — Endpoint antivirus and Microsoft Defender / MDE posture check (PowerShell 5.1+).
 
 .DESCRIPTION
-  Detects and reports:
+  This script is intended for RMM execution. It gathers signals from:
+    1) Windows Security Center (WSC) for installed AV products and real-time status
+    2) Microsoft Defender (Get-MpComputerStatus) for service/RT/signature/scan health
+    3) Microsoft Defender for Endpoint (Sense service) for basic onboarding visibility
+    4) Related security services for vendor/EDR footprint (best-effort)
 
-    • What antivirus products are installed (via Windows Security Center).
-    • Which AV(s) have real-time protection enabled.
-    • Whether multiple AVs are running with real-time protection (conflict).
-    • Microsoft Defender health (service status, real-time, signature age, scan age).
-    • Microsoft Defender for Endpoint (MDE / Sense) onboarding status.
-    • Related AV / EDR services for vendor visibility.
+  It then evaluates those signals against configurable thresholds and emits a
+  single-line result suitable for monitoring/alerting, plus optional verbose/debug output.
 
-  Output:
-    • Default: single line suitable for RMM parsing.
-    • -Full   : multi-line human readable summary for ticket notes.
-    • -AsJson : JSON object for advanced parsing.
+  IMPORTANT NOTES
+    - WSC can lag behind reality immediately after AV install/uninstall.
+    - Some third-party AV products do not expose granular state via WSC.
+    - MDE onboarding is represented here as “Sense service present + running”
+      (this is a practical heuristic, not a full compliance attestation).
+
+.PARAMETER MaxSigAgeHours
+  Maximum allowed age (hours) of Defender AV signatures before warning/critical.
+
+.PARAMETER MaxQuickScanAgeDays
+  Maximum allowed age (days) of last quick scan before warning.
+
+.PARAMETER MaxFullScanAgeDays
+  Maximum allowed age (days) of last full scan before warning.
+
+.PARAMETER RequireRealTime
+  If set, the script will raise severity when no real-time AV is enabled.
+
+.PARAMETER RequireMDE
+  If set, the script will raise severity when MDE (Sense) is not onboarded.
+
+.PARAMETER DebugMode
+  If set, emits additional debug lines (useful for troubleshooting templates / parsing).
+
+.OUTPUTS
+  Default: One line intended for RMM parsers, including key-value pairs.
+  With -Full: Additional detail objects can be included (depending on your RMM needs).
 
 .EXIT CODES
-  0 = Secure
-  1 = Warning (old scans, stale signatures, soft issues)
-  2 = Critical (no RT AV, multiple RT AV, core control missing)
+  0 = Secure / OK
+  1 = Warning (stale signatures/scans, soft posture issues)
+  2 = Critical (no real-time AV, multiple real-time AV engines, required control missing)
   4 = Script error (unhandled / environment issue)
-#>
 
+
+#>
 
 [CmdletBinding()]
 param(
-  [switch]$Full,
-  [switch]$AsJson,
+  # Defender signatures are considered "fresh" within this many hours
+  [int]$SigFreshHours = 48,
 
-  [int]$SigFreshHours       = 48,
+  # Quick scan should have occurred within this many days
   [int]$MaxQuickScanAgeDays = 14,
-  [int]$MaxFullScanAgeDays  = 30,
 
+  # Full scan should have occurred within this many days
+  [int]$MaxFullScanAgeDays = 30,
+
+  # If true, flag Critical if no AV engine is real-time enabled
   [switch]$RequireRealTime,
+
+  # If true, flag Warning/Critical when MDE is not onboarded
   [switch]$RequireMDE,
 
-  [switch]$DebugMode
+  # If true, emit additional debug log lines
+  [switch]$DebugMode,
+
+  # If true, emit a more verbose, multi-line output
+  [switch]$Full,
+
+  # If true, emit JSON output (structured, for ingestion)
+  [switch]$AsJson
 )
 
-
-# --- TEMP: Execution Policy bypass for this PowerShell process (testing only) ---
-try {
-    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
-} catch {
-    # Non-fatal: some environments may block even Process scope changes
-}
+# ---------------------------------------------------------------------------
+# ----------------------------- Globals / helpers -----------------------------
 # ---------------------------------------------------------------------------
 
+# Debug log buffer (only printed if -DebugMode)
+$script:DebugLog = New-Object System.Collections.Generic.List[string]
 
+# Issues list used to build final severity/summary
+$script:Issues = New-Object System.Collections.Generic.List[pscustomobject]
 
-# ----------------------------- Globals / helpers -----------------------------
-$script:Issues    = @()
-$script:DebugLog  = @()
+function Add-Debug {
+  param([string]$Message)
+  if ($DebugMode) {
+    $ts = (Get-Date).ToString('s')
+    $script:DebugLog.Add(("{0} {1}" -f $ts, $Message)) | Out-Null
+  }
+}
 
 function Add-Issue {
   param(
+    [Parameter(Mandatory = $true)][ValidateSet('Warning','Critical')][string]$Severity,
     [Parameter(Mandatory = $true)][string]$Short,
-    [ValidateSet('OK','Warning','Critical')][string]$Severity = 'Warning',
     [string]$Details,
     [string]$Recommendation
   )
-  $script:Issues += [pscustomobject]@{
-    Short          = $Short
+
+  $script:Issues.Add([pscustomobject]@{
     Severity       = $Severity
+    Short          = $Short
     Details        = $Details
     Recommendation = $Recommendation
-  }
+  }) | Out-Null
 }
 
-function Add-Debug {
-  param(
-    [Parameter(Mandatory = $true)][string]$Message
-  )
-  $entry = '[{0}] {1}' -f (Get-Date).ToString('s'), $Message
-  $script:DebugLog += $entry
-}
-
+# ---------------------------------------------------------------------------
 # ----------------------------- Core info functions -----------------------------
+# ---------------------------------------------------------------------------
+
 function Get-DefenderInfo {
-  Add-Debug 'Get-DefenderInfo: starting query for WinDefend + Get-MpComputerStatus.'
-  $svc = $null
-  $mp  = $null
+  Add-Debug 'Get-DefenderInfo: querying Get-MpComputerStatus.'
 
-  try {
-    $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
-  } catch {
-    Add-Debug ("Get-DefenderInfo: Get-Service WinDefend failed: {0}" -f $_.Exception.Message)
-  }
-
+  $mp = $null
   try {
     $mp = Get-MpComputerStatus -ErrorAction Stop
-    Add-Debug 'Get-DefenderInfo: Get-MpComputerStatus succeeded.'
   } catch {
     Add-Debug ("Get-DefenderInfo: Get-MpComputerStatus failed: {0}" -f $_.Exception.Message)
   }
 
-  # Real-time protection: TRUST Defender API first
-  $rtEnabled = $false
-  if ($mp) {
-    $rtEnabled = [bool]$mp.RealTimeProtectionEnabled
-    Add-Debug ("Get-DefenderInfo: RealTimeProtectionEnabled from API = {0}" -f $rtEnabled)
-  } elseif ($svc -and $svc.Status -eq 'Running') {
-    # Fallback heuristic if cmdlet fails
-    $rtEnabled = $true
-    Add-Debug 'Get-DefenderInfo: MpComputerStatus missing; inferring RT=ON because WinDefend is Running.'
-  } else {
-    Add-Debug 'Get-DefenderInfo: No Defender service or MpComputerStatus; treating Defender as not present.'
-  }
+  # Determine service status (Defender AV service)
+  $svc = Get-Service -Name 'WinDefend' -ErrorAction SilentlyContinue
 
-  $sigLast = $null
+  # Signature age (hours) calculation (if we have a valid timestamp)
   $sigAgeH = $null
   if ($mp -and $mp.AntivirusSignatureLastUpdated) {
-    $sigLast = [datetime]$mp.AntivirusSignatureLastUpdated
-    $sigAgeH = ((Get-Date) - $sigLast).TotalHours
-    Add-Debug ("Get-DefenderInfo: Signature last updated {0}, age {1:N1}h." -f $sigLast, $sigAgeH)
+    $sigAgeH = [math]::Round(((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalHours, 1)
   }
 
-  [pscustomobject]@{
-    Present                   = [bool]$svc
+  # Return a stable, structured object (do not rely on raw $mp in later code)
+  return [pscustomobject]@{
+    Present                   = [bool]$mp
     ServiceStatus             = if ($svc) { $svc.Status.ToString() } else { 'NotPresent' }
-    RealTimeProtectionEnabled = $rtEnabled
-    SigLastUpdated            = $sigLast
+    RealTimeProtectionEnabled = if ($mp) { [bool]$mp.RealTimeProtectionEnabled } else { $null }
     SigAgeHours               = $sigAgeH
     AVSignatureVersion        = if ($mp) { $mp.AntivirusSignatureVersion } else { $null }
     LastQuickScan             = if ($mp) { $mp.QuickScanEndTime } else { $null }
@@ -138,14 +153,13 @@ function Get-DefenderInfo {
 function Get-WSCAVProducts {
   Add-Debug 'Get-WSCAVProducts: querying root/SecurityCenter2 AntiVirusProduct.'
   $out  = @()
-  $list = @()
 
+  # Query Windows Security Center (WSC) inventory of AV products
+  $list = @()
   try {
-    $list = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop
-    Add-Debug ("Get-WSCAVProducts: retrieved {0} AV product(s) from SecurityCenter2." -f $list.Count)
+    $list = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName 'AntiVirusProduct' -ErrorAction Stop
   } catch {
-    Add-Debug ("Get-WSCAVProducts: failed to query SecurityCenter2: {0}" -f $_.Exception.Message)
-    Add-Issue 'Failed to query Windows Security Center (SecurityCenter2).' -Severity 'Warning' -Details $_.Exception.Message
+    Add-Debug ("Get-WSCAVProducts: query failed: {0}" -f $_.Exception.Message)
     return @()
   }
 
@@ -162,7 +176,7 @@ function Get-WSCAVProducts {
       $sigUpToDate = [bool]($raw -band 0x100000)
     }
 
-    Add-Debug ("Get-WSCAVProducts: {0} state={1} RT={2} SigUpToDate={3}" -f $p.displayName, $raw, $rtEnabled, $sigUpToDate)
+    Add-Debug ("Get-WSCAVProducts: {0} state={1} RT={2} Sig...UpToDate={3}" -f $p.displayName, $raw, $rtEnabled, $sigUpToDate)
 
     $out += [pscustomobject]@{
       DisplayName        = $p.displayName
@@ -179,14 +193,10 @@ function Get-WSCAVProducts {
 }
 
 function Get-MDEInfo {
-  Add-Debug 'Get-MDEInfo: querying Sense service.'
-  $svc = $null
-  try {
-    $svc = Get-Service -Name Sense -ErrorAction SilentlyContinue
-  } catch {
-    Add-Debug ("Get-MDEInfo: Get-Service Sense failed: {0}" -f $_.Exception.Message)
-  }
+  # MDE uses the "Sense" service. Presence + running is used as onboarding proxy.
+  Add-Debug 'Get-MDEInfo: checking Sense service.'
 
+  $svc       = Get-Service -Name 'Sense' -ErrorAction SilentlyContinue
   $present   = [bool]$svc
   $status    = if ($svc) { $svc.Status.ToString() } else { 'NotPresent' }
   $onboarded = ($svc -and $svc.Status -eq 'Running')
@@ -224,16 +234,19 @@ function Get-RelatedSecurityServices {
   }
 
   $hits = $hits | Sort-Object Name -Unique
-  Add-Debug ("Get-RelatedSecurityServices: found {0} matching service(s)." -f $hits.Count)
 
-  if ($hits) {
-    $hits | Select-Object Name, DisplayName, Status, StartType
-  } else {
-    @()
-  }
+  # Return service hits for visibility only (not used to drive severity directly)
+  return $hits | Select-Object Name, DisplayName, Status, StartType
 }
 
+# ---------------------------------------------------------------------------
 # ----------------------------- Main logic with catch-all -----------------------------
+# STEP 0 — Initialise runtime state
+#   - $startTime is used for duration / telemetry.
+#   - $severity is the running classification that will map to the script exit code.
+#   - $result will hold the final structured output object.
+# ---------------------------------------------------------------------------
+
 $startTime = Get-Date
 $severity  = 'OK'
 $result    = $null
@@ -241,12 +254,23 @@ $result    = $null
 try {
   Add-Debug ('Script start on {0} as user {1}' -f $env:COMPUTERNAME, (whoami))
 
+  # STEP 1 — Collect raw signals
+  #   Gather the raw facts first (do not classify yet):
+  #     - Defender health (Get-MpComputerStatus)
+  #     - WSC AV products (installed + RT status, best-effort decode)
+  #     - MDE onboarding proxy (Sense service)
+  #     - Related security services for vendor visibility
   $def      = Get-DefenderInfo
   $products = Get-WSCAVProducts
   $mde      = Get-MDEInfo
   $svcHits  = Get-RelatedSecurityServices
 
   # ----------------------------- AV analysis -----------------------------
+  # STEP 2 — Normalise and interpret AV posture
+  #   Convert raw WSC + Defender signals into:
+  #     - Installed AV list (human-readable)
+  #     - Real-time enabled AV engines (Defender + 3rd party)
+  #     - Primary/Active AV selection (for dashboard reporting)
   $installedAVs = $products
 
   # Real-time info for 3rd-party AV from WSC
@@ -254,95 +278,95 @@ try {
   Add-Debug ("AV analysis: rtAVs_WSC count={0}" -f $rtAVs_WSC.Count)
 
   # Trust Defender RT first
-  $rtFromDef = ($def.RealTimeProtectionEnabled -eq $true)
-  Add-Debug ("AV analysis: Defender RT from API={0}" -f $rtFromDef)
+  $defRT = ($def.Present -and $def.RealTimeProtectionEnabled -eq $true -and $def.ServiceStatus -eq 'Running')
 
-  # Multi-AV detection (3rd-party via WSC)
-  $rtMulti = ($rtAVs_WSC.Count -gt 1)
-  if ($rtMulti) { Add-Debug 'AV analysis: multiple AVs with RT detected.' }
+  # Determine how many real-time engines are enabled (Defender + 3rd party)
+  $rtEngines = @()
+  if ($defRT) { $rtEngines += 'Microsoft Defender Antivirus' }
+  if ($rtAVs_WSC.Count -gt 0) { $rtEngines += ($rtAVs_WSC.DisplayName | Sort-Object -Unique) }
 
-  # Classification
-  $classification = $null
+  $rtEngines = $rtEngines | Sort-Object -Unique
 
-  if ($rtMulti) {
-    $names = ($rtAVs_WSC.DisplayName | Sort-Object -Unique) -join ', '
-    $classification = 'Multiple AV with real-time enabled'
-    Add-Issue "Multiple antivirus products have real-time protection enabled: $names" -Severity 'Critical'
-  }
-  elseif ($rtAVs_WSC.Count -eq 1) {
-    $activeThird = $rtAVs_WSC[0]
-    if ($activeThird.DisplayName -match 'Bitdefender|Managed Antivirus') {
-      $classification = 'Managed Antivirus / Bitdefender (real-time ON)'
-    } else {
-      $classification = "3rd-party AV: $($activeThird.DisplayName) (real-time ON)"
-    }
-  }
-  elseif ($rtFromDef -and $def.Present -and $def.ServiceStatus -eq 'Running') {
-    $classification = 'Defender (real-time ON)'
-  }
-  else {
-    # No AV with realtime enabled anywhere
-    if ($installedAVs.Count -gt 0 -or $def.Present) {
-      $classification = 'AV installed but real-time protection is OFF'
-      Add-Issue 'Real-time antivirus protection is OFF' -Severity 'Critical'
-    } else {
-      $classification = 'No antivirus installed'
-      Add-Issue 'No antivirus installed or registered in Windows Security Center' -Severity 'Critical'
-    }
+  # Detect multiple RT engines (common cause of instability / conflicts)
+  if ($rtEngines.Count -gt 1) {
+    Add-Issue -Severity 'Critical' `
+      -Short ("Multiple real-time AV engines: {0}" -f ($rtEngines -join ', ')) `
+      -Details 'More than one AV engine reports real-time protection enabled.' `
+      -Recommendation 'Ensure only one real-time AV product is enabled. Remove/disable the others and re-check.'
   }
 
-  # Defender-specific checks
+  # If RequireRealTime is set, enforce at least one RT engine
+  if ($RequireRealTime -and $rtEngines.Count -eq 0) {
+    Add-Issue -Severity 'Critical' `
+      -Short 'No real-time AV enabled' `
+      -Details 'Neither Defender nor any third-party AV reports real-time protection enabled.' `
+      -Recommendation 'Enable real-time protection for the installed AV or deploy a supported AV solution.'
+  }
+
+  # Defender-specific checks (only if present)
   if ($def.Present) {
+
+    # Defender service must be running for Defender to meaningfully protect
     if ($def.ServiceStatus -ne 'Running') {
-      Add-Issue "Defender service not running (Status=$($def.ServiceStatus))" -Severity 'Critical'
+      Add-Issue -Severity 'Critical' `
+        -Short ("Defender service not running ({0})" -f $def.ServiceStatus) `
+        -Details 'WinDefend service is not running.' `
+        -Recommendation 'Start WinDefend service and confirm Defender is not disabled by policy or third-party AV.'
     }
 
-    if ($RequireRealTime -and -not $def.RealTimeProtectionEnabled) {
-      Add-Issue 'Defender real-time protection is OFF while required' -Severity 'Critical'
+    # Signature freshness check (soft posture issue unless extremely stale)
+    if ($null -ne $def.SigAgeHours -and $def.SigAgeHours -gt $SigFreshHours) {
+      Add-Issue -Severity 'Warning' `
+        -Short ("Defender signatures stale ({0}h)" -f $def.SigAgeHours) `
+        -Details ("Signature age exceeds configured threshold ({0}h)." -f $SigFreshHours) `
+        -Recommendation 'Trigger signature update, validate Windows Update connectivity, and ensure Defender updates are not blocked.'
     }
 
-    if ($def.SigAgeHours -ne $null) {
-      if ($def.SigAgeHours -gt [double]$SigFreshHours) {
-        Add-Issue ("Defender signatures older than {0} hours" -f $SigFreshHours) -Severity 'Warning'
+    # Quick scan age check (warning posture)
+    if ($def.LastQuickScan) {
+      $qDays = [math]::Floor(((Get-Date) - $def.LastQuickScan).TotalDays)
+      if ($qDays -gt $MaxQuickScanAgeDays) {
+        Add-Issue -Severity 'Warning' `
+          -Short ("Quick scan old ({0}d)" -f $qDays) `
+          -Details ("Quick scan last completed {0} days ago." -f $qDays) `
+          -Recommendation 'Schedule or trigger a quick scan via Defender.'
       }
     }
 
-    if ($MaxQuickScanAgeDays -gt 0 -and $def.LastQuickScan) {
-      $qsAge = ((Get-Date) - [datetime]$def.LastQuickScan).TotalDays
-      if ($qsAge -gt $MaxQuickScanAgeDays) {
-        Add-Issue ("Last Quick Scan older than {0} days" -f $MaxQuickScanAgeDays) -Severity 'Warning'
-      }
-    }
-
-    if ($MaxFullScanAgeDays -gt 0 -and $def.LastFullScan) {
-      $fsAge = ((Get-Date) - [datetime]$def.LastFullScan).TotalDays
-      if ($fsAge -gt $MaxFullScanAgeDays) {
-        Add-Issue ("Last Full Scan older than {0} days" -f $MaxFullScanAgeDays) -Severity 'Warning'
+    # Full scan age check (warning posture)
+    if ($def.LastFullScan) {
+      $fDays = [math]::Floor(((Get-Date) - $def.LastFullScan).TotalDays)
+      if ($fDays -gt $MaxFullScanAgeDays) {
+        Add-Issue -Severity 'Warning' `
+          -Short ("Full scan old ({0}d)" -f $fDays) `
+          -Details ("Full scan last completed {0} days ago." -f $fDays) `
+          -Recommendation 'Schedule or trigger a full scan via Defender.'
       }
     }
   }
 
-  # MDE requirement
-  if ($RequireMDE -and -not $mde.Onboarded) {
-    Add-Issue 'MDE is required but this endpoint is not onboarded' -Severity 'Critical'
+  # MDE check (only if RequireMDE requested)
+  if ($RequireMDE) {
+    if (-not $mde.SensePresent) {
+      Add-Issue -Severity 'Critical' `
+        -Short 'MDE Sense service not present' `
+        -Details 'Sense service missing; MDE agent not installed.' `
+        -Recommendation 'Install/repair MDE onboarding package and confirm service exists.'
+    } elseif (-not $mde.Onboarded) {
+      Add-Issue -Severity 'Warning' `
+        -Short ("MDE not onboarded (Sense: {0})" -f $mde.SenseStatus) `
+        -Details 'Sense service present but not running.' `
+        -Recommendation 'Check onboarding status, service startup type, and tenant connectivity.'
+    }
   }
 
-  # Overall severity
-  if ($script:Issues.Count -gt 0) {
-    if ($script:Issues | Where-Object { $_.Severity -eq 'Critical' }) {
-      $severity = 'Critical'
-    }
-    elseif ($script:Issues | Where-Object { $_.Severity -eq 'Warning' }) {
-      $severity = 'Warning'
-    }
-  }
-
-  # ----------------------------- Active vs Installed AV -----------------------------
+  # Build installed AV summary (human-readable)
   $installedAVNames = @()
-  if ($installedAVs.Count -gt 0) {
-    $installedAVNames = $installedAVs.DisplayName | Sort-Object -Unique
+  if ($products -and $products.Count -gt 0) {
+    $installedAVNames += ($products.DisplayName | Sort-Object -Unique)
   }
 
+  # Add Defender to installed list if present and running (sometimes WSC inventory lags)
   if ($def.Present -and $def.ServiceStatus -eq 'Running') {
     if (-not ($installedAVNames -like '*Defender*')) {
       $installedAVNames += 'Microsoft Defender Antivirus'
@@ -358,7 +382,6 @@ try {
   #   3) First installed AV from WSC
   #   4) None
   $primaryAVName = 'None'
-
   if ($rtAVs_WSC.Count -gt 0) {
     $primaryAVName = ($rtAVs_WSC.DisplayName | Sort-Object -Unique)[0]
   }
@@ -375,45 +398,50 @@ try {
     'None'
   }
 
-  # Real-time state for summary
-  $hasRT = $rtFromDef -or ($rtAVs_WSC.Count -gt 0)
+  $rtSummary = if ($rtEngines.Count -gt 0) { $rtEngines -join '; ' } else { 'None' }
 
-  $rtState = if ($rtMulti) {
-    'Multi'
-  }
-  elseif ($hasRT) {
-    'On'
-  }
-  else {
-    'Off'
-  }
-
-  # Signature state (Defender only – best effort)
-  $sigState = 'Unknown'
-  if ($def.SigAgeHours -ne $null) {
-    if ($def.SigAgeHours -le [double]$SigFreshHours) {
-      $sigState = 'Up to date'
-    } else {
-      $sigState = 'Out of date'
+  # STEP 3 — Classify posture into severity
+  #   Issues are accumulated in $script:Issues (Critical/Warning) during analysis.
+  #   Here we collapse those issues into a single overall $severity value for RMM.
+  # Overall severity
+  if ($script:Issues.Count -gt 0) {
+    if ($script:Issues | Where-Object { $_.Severity -eq 'Critical' }) {
+      $severity = 'Critical'
+    }
+    elseif ($script:Issues | Where-Object { $_.Severity -eq 'Warning' }) {
+      $severity = 'Warning'
     }
   }
 
   $elapsed = ((Get-Date) - $startTime).TotalSeconds
 
+  # STEP 4 — Build the output payload
+  #   $result is the single source of truth for output formatting.
+  #   Keep it stable so your RMM parser/template does not break on changes.
   $result = [pscustomobject]@{
     Timestamp      = (Get-Date).ToString('s')
-    ComputerName   = $env:COMPUTERNAME
-    Status         = $severity
-    Classification = $classification
-    PrimaryAV      = $primaryAVName
+    Hostname       = $env:COMPUTERNAME
+    Severity       = $severity
+
+    # Primary/Active AV name for dashboards
+    ActiveAV       = $primaryAVName
+
+    # Human-readable summaries
     InstalledAV    = $installedSummary
-    RealTimeState  = $rtState
-    SignatureState = $sigState
-    Issues         = $script:Issues
+    RealTimeAV     = $rtSummary
+
+    # Defender details
     Defender       = $def
+
+    # MDE details
     MDE            = $mde
-    AVProducts     = $products
+
+    # Issues list (drives summary + tickets)
+    Issues         = $script:Issues
+
+    # Service visibility only
     RelatedServices= $svcHits
+
     ElapsedSeconds = $elapsed
     DebugLog       = $script:DebugLog
     Parameters     = [pscustomobject]@{
@@ -425,28 +453,31 @@ try {
       DebugMode           = [bool]$DebugMode
     }
   }
-
-} catch {
-  # Catch-all for unexpected runtime failures
+}
+catch {
+  # Catch-all: produce a stable error result so the RMM parser still gets output
   $msg = $_.Exception.Message
   Add-Debug ("MAIN: unhandled exception: {0}" -f $msg)
-  Add-Issue 'Script runtime error (unhandled exception).' -Severity 'Critical' -Details $msg
 
   $elapsed = ((Get-Date) - $startTime).TotalSeconds
 
   $result = [pscustomobject]@{
     Timestamp      = (Get-Date).ToString('s')
-    ComputerName   = $env:COMPUTERNAME
-    Status         = 'Error'
-    Classification = 'Script error'
-    PrimaryAV      = 'Unknown'
+    Hostname       = $env:COMPUTERNAME
+    Severity       = 'Error'
+    ActiveAV       = 'Unknown'
     InstalledAV    = 'Unknown'
-    RealTimeState  = 'Unknown'
-    SignatureState = 'Unknown'
-    Issues         = $script:Issues
+    RealTimeAV     = 'Unknown'
     Defender       = $null
     MDE            = $null
-    AVProducts     = @()
+    Issues         = @(
+      [pscustomobject]@{
+        Severity       = 'Critical'
+        Short          = "Script error: $msg"
+        Details        = $msg
+        Recommendation = 'Check PowerShell execution policy, required modules, and permissions.'
+      }
+    )
     RelatedServices= @()
     ElapsedSeconds = $elapsed
     DebugLog       = $script:DebugLog
@@ -472,107 +503,75 @@ function Write-AVOutput {
     [switch]$DebugMode
   )
 
+  # If JSON requested, emit structured object for ingestion
   if ($AsJson) {
     $Result | ConvertTo-Json -Depth 6
     return
   }
 
-  # Issues summary
+  # Issues summary (flatten issues into a short, single-line string)
   $issuesSummary = 'None'
   if ($Result.Issues -and $Result.Issues.Count -gt 0) {
     $shorts = $Result.Issues | ForEach-Object { $_.Short } | Where-Object { $_ } | Select-Object -Unique
     $issuesSummary = ($shorts -join '; ')
   }
 
-  # Debug summary
+  # Debug summary (only included when DebugMode true)
   $debugSummary = 'None'
   if ($DebugMode -and $Result.DebugLog -and $Result.DebugLog.Count -gt 0) {
-    # First log line only to keep one-liner reasonable
-    $debugSummary = $Result.DebugLog[0]
+    $debugSummary = ('{0} lines' -f $Result.DebugLog.Count)
   }
 
   if (-not $Full) {
-    # One-liner for RMM (enhanced with Defender platform/engine/service)
-    $amProduct = if ($Result.Defender -and $Result.Defender.AMProductVersion) { $Result.Defender.AMProductVersion } else { 'N/A' }
-    $amEngine  = if ($Result.Defender -and $Result.Defender.AMEngineVersion)  { $Result.Defender.AMEngineVersion }  else { 'N/A' }
-    $amService = if ($null -ne $Result.Defender.AMServiceEnabled) { $Result.Defender.AMServiceEnabled } else { 'N/A' }
-
-    $line = '[{0}] {1} | Status:{2} | ActiveAV:{3} | InstalledAV:{4} | Classification:{5} | RT:{6} | Sig:{7} | AMProduct:{8} | AMEngine:{9} | AMService:{10} | MDE:{11} | Issues:{12}' -f `
-      $Result.Timestamp,
-      $Result.ComputerName,
-      $Result.Status,
-      $Result.PrimaryAV,
+    # Default: single-line RMM-friendly output
+    # Keep key names stable for monitors/templates.
+    Write-Output ("Status:{0} | ActiveAV:{1} | InstalledAV:{2} | RealTimeAV:{3} | Issues:{4} | SigAgeHours:{5} | MDE:{6}" -f `
+      $Result.Severity,
+      $Result.ActiveAV,
       $Result.InstalledAV,
-      $Result.Classification,
-      $Result.RealTimeState,
-      $Result.SignatureState,
-      $amProduct,
-      $amEngine,
-      $amService,
-      ('Sense=' + ($Result.MDE.SenseStatus)),
-      $issuesSummary
+      $Result.RealTimeAV,
+      $issuesSummary,
+      $Result.Defender.SigAgeHours,
+      $(if ($Result.MDE) {
+    "SensePresent=$($Result.MDE.SensePresent);Onboarded=$($Result.MDE.Onboarded);Status=$($Result.MDE.SenseStatus)"
+} else {
+    'Unknown'
+})    )
 
     if ($DebugMode) {
-      $line = $line + (" | Debug:{0}" -f $debugSummary)
+      Write-Output ("Debug:{0}" -f $debugSummary)
     }
 
-    Write-Output $line
     return
   }
 
-  # Full output
-  Write-Output ('===== AV / MDE Security Check (Elapsed: {0:N1}s) =====' -f $Result.ElapsedSeconds)
-  Write-Output ('Computer      : {0}' -f $Result.ComputerName)
-  Write-Output ('Overall Status: {0}' -f $Result.Status)
-  Write-Output ('Classification: {0}' -f $Result.Classification)
-  Write-Output ('Checked At    : {0}' -f $Result.Timestamp)
+  # Full mode: multi-line output suitable for tickets / human review
+  Write-Output ("Status: {0}" -f $Result.Severity)
+  Write-Output ("ActiveAV: {0}" -f $Result.ActiveAV)
+  Write-Output ("InstalledAV: {0}" -f $Result.InstalledAV)
+  Write-Output ("RealTimeAV: {0}" -f $Result.RealTimeAV)
+  Write-Output ("ElapsedSeconds: {0}" -f $Result.ElapsedSeconds)
+
   Write-Output ''
-
-  Write-Output 'Antivirus'
-  Write-Output ('  Active AV   : {0}' -f $Result.PrimaryAV)
-  Write-Output ('  Installed   : {0}' -f $Result.InstalledAV)
-  Write-Output ('  RT State    : {0}' -f $Result.RealTimeState)
-  Write-Output ('  Sig State   : {0}' -f $Result.SignatureState)
-
+  Write-Output 'Defender'
   if ($Result.Defender) {
-    Write-Output ''
-    Write-Output 'Defender details'
-    Write-Output ('  Present     : {0}' -f $Result.Defender.Present)
-    Write-Output ('  Service     : {0}' -f $Result.Defender.ServiceStatus)
-    Write-Output ('  RT Enabled  : {0}' -f $Result.Defender.RealTimeProtectionEnabled)
-    Write-Output ('  AM Product  : {0}' -f $Result.Defender.AMProductVersion)
-    Write-Output ('  AM Engine   : {0}' -f $Result.Defender.AMEngineVersion)
-    Write-Output ('  AM Service  : {0}' -f $Result.Defender.AMServiceEnabled)
-    Write-Output ('  Sig Age (h) : {0}' -f $Result.Defender.SigAgeHours)
-    Write-Output ('  Last QScan  : {0}' -f $Result.Defender.LastQuickScan)
-    Write-Output ('  Last FScan  : {0}' -f $Result.Defender.LastFullScan)
+    $Result.Defender | Format-List | Out-String | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ } | ForEach-Object { Write-Output $_ }
+  } else {
+    Write-Output '  Not available'
   }
 
   Write-Output ''
-  Write-Output 'All AV products (WSC)'
-  if ($Result.AVProducts.Count -gt 0) {
-    foreach ($p in $Result.AVProducts) {
-      Write-Output ("  - {0} | RT:{1} | SigUpToDate:{2} | State:{3}" -f `
-        $p.DisplayName, $p.RealTime, $p.SignaturesUpToDate, $p.ProductStateRaw)
-    }
+  Write-Output 'MDE'
+  if ($Result.MDE) {
+    $Result.MDE | Format-List | Out-String | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ } | ForEach-Object { Write-Output $_ }
   } else {
-    Write-Output '  (None registered in Windows Security Center or query failed)'
-  }
-
-  Write-Output ''
-  Write-Output 'Related security services'
-  if ($Result.RelatedServices -and $Result.RelatedServices.Count -gt 0) {
-    foreach ($s in $Result.RelatedServices) {
-      Write-Output ("  - {0} | {1} | {2} | {3}" -f $s.Name, $s.DisplayName, $s.Status, $s.StartType)
-    }
-  } else {
-    Write-Output '  (No obvious 3rd-party AV/EDR services found or query failed)'
+    Write-Output '  Not available'
   }
 
   Write-Output ''
   Write-Output 'Issues'
-  if ($Result.Issues.Count -eq 0) {
-    Write-Output '  None detected.'
+  if (-not $Result.Issues -or $Result.Issues.Count -eq 0) {
+    Write-Output '  None'
   } else {
     $i = 1
     foreach ($issue in $Result.Issues) {
@@ -595,23 +594,29 @@ function Write-AVOutput {
         Write-Output ("  {0}" -f $d)
       }
     } else {
-      Write-Output '  (No debug entries)'
+      Write-Output '  None'
     }
   }
 
   Write-Output ''
-  Write-Output 'Parameters'
-  Write-Output ("  SigFreshHours       : {0}" -f $Result.Parameters.SigFreshHours)
-  Write-Output ("  MaxQuickScanAgeDays : {0}" -f $Result.Parameters.MaxQuickScanAgeDays)
-  Write-Output ("  MaxFullScanAgeDays  : {0}" -f $Result.Parameters.MaxFullScanAgeDays)
-  Write-Output ("  RequireRealTime     : {0}" -f $Result.Parameters.RequireRealTime)
-  Write-Output ("  RequireMDE          : {0}" -f $Result.Parameters.RequireMDE)
-  Write-Output ("  DebugMode           : {0}" -f $Result.Parameters.DebugMode)
+  Write-Output 'Related security services'
+  if ($Result.RelatedServices -and $Result.RelatedServices.Count -gt 0) {
+    $Result.RelatedServices | Format-Table -AutoSize | Out-String | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ } | ForEach-Object { Write-Output $_ }
+  } else {
+    Write-Output '  None found'
+  }
 }
 
+# STEP 5 — Emit output in the required format
+#   - Default: single-line key=value output for RMM parsing
+#   - -Full: human-friendly multi-line output (useful for tickets / troubleshooting)
+#   - -AsJson: structured output for downstream ingestion (if your tooling supports it)
 Write-AVOutput -Result $result -Full:$Full -AsJson:$AsJson -DebugMode:$DebugMode
 
 # ----------------------------- Exit code -----------------------------
+# STEP 6 — Exit with an RMM-friendly code
+#   RMM platforms typically map exit codes to OK/Warn/Critical states.
+#   Keep this mapping stable to avoid alerting regressions.
 switch ($severity) {
   'Critical' { exit 2 }
   'Warning'  { exit 1 }
