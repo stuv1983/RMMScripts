@@ -102,8 +102,21 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 # ----------------------------- CORE HELPER FUNCTIONS (UNCHANGED) -----------------------------
 
 function Get-SC2AV { # Windows Security Center (all registered AV)
-  try { Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop }
-  catch { try { Get-WmiObject -Namespace root/SecurityCenter2 -Class AntiVirusProduct } catch { @() } }
+  # Prefer CIM. If the default transport fails (often due to WinRM configuration), retry CIM via DCOM.
+  # Only fall back to legacy WMI as a last resort.
+  try {
+    return Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop
+  }
+  catch {
+    try {
+      $opt = New-CimSessionOption -Protocol Dcom
+      return Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -CimSession (New-CimSession -SessionOption $opt) -ErrorAction Stop
+    }
+    catch {
+      try { return Get-WmiObject -Namespace root/SecurityCenter2 -Class AntiVirusProduct -ErrorAction Stop }
+      catch { return @() }
+    }
+  }
 }
 
 function Convert-WscProductState { param([object]$State) # Decode hex state to booleans
@@ -162,10 +175,17 @@ function Get-BitdefenderInfo { # N‑able Managed AV
 }
 
 function Get-RelatedServices { # Spot 3rd‑party engines/EDR by services
-  $patterns='defender','bitdefender','managed antivirus','sophos','mcafee','trend','kaspersky','eset','avast','avg','norton','symantec','hp wolf','hp security','sentinelone','crowdstrike','carbonblack','webroot','malwarebytes','cbdefense','csfalcon','ekrn','savservice','mbamservice','wrs' 
-  $all=Get-Service -ErrorAction SilentlyContinue; $hits=@()
-  foreach($p in $patterns){ $hits += ($all | Where-Object { $_.Name -match $p -or $_.DisplayName -match $p }) }
-  if($hits){ $hits | Sort-Object Name -Unique | Select-Object Name,DisplayName,Status,StartType }
+  # PERF: single-pass filter rather than N * Where-Object scans.
+  # Note: escape/quote carefully because some patterns contain spaces.
+  $patternList = @(
+    'defender','bitdefender','managed antivirus','sophos','mcafee','trend','kaspersky','eset','avast','avg','norton','symantec',
+    'hp wolf','hp security','sentinelone','crowdstrike','carbonblack','webroot','malwarebytes','cbdefense','csfalcon','ekrn','savservice','mbamservice','wrs'
+  )
+  $rx = [regex]::new('(' + (($patternList | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+  $all = Get-Service -ErrorAction SilentlyContinue
+  $hits = $all | Where-Object { $rx.IsMatch($_.Name) -or $rx.IsMatch($_.DisplayName) }
+  if ($hits) { $hits | Sort-Object Name -Unique | Select-Object Name, DisplayName, Status, StartType }
 }
 
 # Map common vendor -> service name patterns to improve detection
