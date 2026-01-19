@@ -21,15 +21,55 @@
     Version: 1.5 (adds exit codes for RMM)
 #>
 
-# ---------------- SETTINGS ----------------
-$LowSpaceThreshold = 10          # Warn if drive free % < this
-$UserRoot          = 'C:\Users'  # Root for user profiles
-$LargeThresholdGB  = 5           # Flag any folder/file >= this size
-$IncludeHidden     = $true       # Include hidden/system items during sizing
+[CmdletBinding()]
+param(
+    [Parameter()] [int]$LowSpaceThreshold = 10,          # Warn if drive free % < this
+    [Parameter()] [string]$UserRoot = 'C:\Users',         # Root for user profiles
+    [Parameter()] [int]$LargeThresholdGB = 5,             # Flag any folder/file >= this size
+    [Parameter()] [object]$IncludeHidden = $true,         # Include hidden/system items during sizing
+    [Parameter()] [object]$AsJson
+)
+
+function Convert-ToBool {
+    param([Parameter(ValueFromPipeline)][AllowNull()][object]$Value)
+    process {
+        if ($null -eq $Value) { return $false }
+        if ($Value -is [bool]) { return $Value }
+        if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
+            return [bool]([int]$Value)
+        }
+        $v = "$Value".Trim().ToLowerInvariant()
+        switch ($v) {
+            'true'  { return $true }
+            'false' { return $false }
+            '1'     { return $true }
+            '0'     { return $false }
+            default { return $false }
+        }
+    }
+}
+
+$IncludeHidden = Convert-ToBool $IncludeHidden
+$AsJson = Convert-ToBool $AsJson
+
+function Write-Report {
+    param([string]$Message, [ConsoleColor]$ForegroundColor)
+    if (-not $AsJson) {
+        if ($PSBoundParameters.ContainsKey('ForegroundColor')) {
+            Write-Host $Message -ForegroundColor $ForegroundColor
+        } else {
+            Write-Host $Message
+        }
+    }
+}
 
 # ---------------- STATE FLAGS FOR EXIT CODES ----------------
 $LowSpaceFound    = $false       # Set true if any drive is below threshold
 $LargeItemsFound  = $false       # Set true if any large folder/file found
+
+$driveResults = @()
+$profileResults = @()
+$largeItemsResults = @()
 
 # ---------------- HELPERS ----------------
 function To-GB {
@@ -53,12 +93,12 @@ function Get-FolderSizeBytes {
 }
 
 # ---------------- DRIVE USAGE ----------------
-Write-Host "=== Hard Drive Usage Report ===`n"
+Write-Report "=== Hard Drive Usage Report ===`n"
 
 try {
     $drives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
 } catch {
-    Write-Host "ERROR: Unable to query logical disks: $($_.Exception.Message)"
+    Write-Report "ERROR: Unable to query logical disks: $($_.Exception.Message)"
     exit 4
 }
 
@@ -68,20 +108,29 @@ foreach ($d in $drives) {
     $usedGB  = [math]::Round($totalGB - $freeGB, 2)
     $pctFree = if ($d.Size) { [math]::Round(($d.FreeSpace / $d.Size) * 100, 1) } else { 0 }
 
-    Write-Host ("Drive {0}: Total={1} GB | Used={2} GB | Free={3} GB ({4}% free)" -f $d.DeviceID, $totalGB, $usedGB, $freeGB, $pctFree)
+    $driveResults += [pscustomobject]@{
+        Drive      = $d.DeviceID
+        TotalGB    = $totalGB
+        UsedGB     = $usedGB
+        FreeGB     = $freeGB
+        PercentFree = $pctFree
+        LowSpace   = ($pctFree -lt $LowSpaceThreshold)
+    }
+
+    Write-Report ("Drive {0}: Total={1} GB | Used={2} GB | Free={3} GB ({4}% free)" -f $d.DeviceID, $totalGB, $usedGB, $freeGB, $pctFree)
 
     if ($pctFree -lt $LowSpaceThreshold) {
         $LowSpaceFound = $true
-        Write-Host ("WARNING: {0} low on space (< {1}% free)" -f $d.DeviceID, $LowSpaceThreshold) -ForegroundColor Yellow
+        Write-Report ("WARNING: {0} low on space (< {1}% free)" -f $d.DeviceID, $LowSpaceThreshold) -ForegroundColor Yellow
     }
 }
 
 # ---------------- USER PROFILE SIZES ----------------
 if (-not (Test-Path $UserRoot)) {
-    Write-Host "`nUser root not found: $UserRoot"
+    Write-Report "`nUser root not found: $UserRoot"
     # continue; still return low-space status if it was detected
 } else {
-    Write-Host "`n=== User Profile Space Usage ($UserRoot) ===`n"
+    Write-Report "`n=== User Profile Space Usage ($UserRoot) ===`n"
 
     $skip = @('Default','Default User','Public','All Users')
 
@@ -89,7 +138,7 @@ if (-not (Test-Path $UserRoot)) {
         $profiles = Get-ChildItem -Path $UserRoot -Directory -ErrorAction SilentlyContinue |
                     Where-Object { $skip -notcontains $_.Name }
     } catch {
-        Write-Host "ERROR: Unable to enumerate profiles: $($_.Exception.Message)"
+        Write-Report "ERROR: Unable to enumerate profiles: $($_.Exception.Message)"
         exit 4
     }
 
@@ -97,25 +146,29 @@ if (-not (Test-Path $UserRoot)) {
     foreach ($p in $profiles) {
         $bytes = (Get-ChildItem -Path $p.FullName -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
                   Measure-Object -Property Length -Sum).Sum
-        $profileRows += [pscustomobject]@{
+        $row = [pscustomobject]@{
             User   = $p.Name
             Path   = $p.FullName
             SizeGB = To-GB $bytes
         }
+        $profileRows += $row
+        $profileResults += $row
     }
 
     if ($profileRows) {
-        $profileRows | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+        if (-not $AsJson) {
+            $profileRows | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+        }
     } else {
-        Write-Host "No user profiles found."
+        Write-Report "No user profiles found."
     }
 
     # ---------------- PER-USER LARGE PATHS (FOLDERS AND FILES) ----------------
     $thresholdBytes = [int64]($LargeThresholdGB * 1GB)
 
     foreach ($p in $profiles) {
-        Write-Host ""
-        Write-Host ("--- {0} ({1}) ---" -f $p.Name, $p.FullName)
+        Write-Report ""
+        Write-Report ("--- {0} ({1}) ---" -f $p.Name, $p.FullName)
 
         # Top-level subfolders sized recursively; report those >= threshold
         $childDirs = Get-ChildItem -Path $p.FullName -Directory -Force:$IncludeHidden -ErrorAction SilentlyContinue
@@ -125,13 +178,16 @@ if (-not (Test-Path $UserRoot)) {
             $sizeB = Get-FolderSizeBytes -Path $dir.FullName
             if ($sizeB -ge $thresholdBytes) {
                 $LargeItemsFound = $true
-                $bigFolders += [pscustomobject]@{
+                $item = [pscustomobject]@{
                     ItemType = 'Folder'
+                    User     = $p.Name
                     Name     = $dir.Name
                     SizeGB   = To-GB $sizeB
                     Path     = $dir.FullName
                     Modified = $dir.LastWriteTime
                 }
+                $bigFolders += $item
+                $largeItemsResults += $item
             }
         }
 
@@ -140,26 +196,44 @@ if (-not (Test-Path $UserRoot)) {
                     Where-Object { $_.Length -ge $thresholdBytes } |
                     ForEach-Object {
                         $LargeItemsFound = $true
-                        [pscustomobject]@{
+                        $item = [pscustomobject]@{
                             ItemType = 'File'
+                            User     = $p.Name
                             Name     = $_.Name
                             SizeGB   = To-GB $_.Length
                             Path     = $_.FullName
                             Modified = $_.LastWriteTime
                         }
+                        $largeItemsResults += $item
+                        $item
                     }
 
         if (($bigFolders.Count + $bigFiles.Count) -gt 0) {
-            Write-Host ("Large items (>= {0} GB) for user {1}:" -f $LargeThresholdGB, $p.Name)
-            ($bigFolders + $bigFiles) | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+            Write-Report ("Large items (>= {0} GB) for user {1}:" -f $LargeThresholdGB, $p.Name)
+            if (-not $AsJson) {
+                ($bigFolders + $bigFiles) | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+            }
         } else {
-            Write-Host ("No folders/files >= {0} GB under this profile." -f $LargeThresholdGB)
+            Write-Report ("No folders/files >= {0} GB under this profile." -f $LargeThresholdGB)
         }
     }
 }
 
 # ---------------- SUMMARY / EXIT CODE ----------------
-Write-Host "`n=== Check complete ==="
+Write-Report "`n=== Check complete ==="
+
+if ($AsJson) {
+    [pscustomobject]@{
+        LowSpaceThreshold = $LowSpaceThreshold
+        LargeThresholdGB = $LargeThresholdGB
+        UserRoot          = $UserRoot
+        LowSpaceFound     = $LowSpaceFound
+        LargeItemsFound   = $LargeItemsFound
+        Drives            = $driveResults
+        Profiles          = $profileResults
+        LargeItems        = $largeItemsResults
+    } | ConvertTo-Json -Depth 5
+}
 
 try {
     if ($LowSpaceFound -and $LargeItemsFound) { exit 3 }
@@ -167,6 +241,6 @@ try {
     elseif ($LargeItemsFound)               { exit 2 }
     else                                    { exit 0 }
 } catch {
-    Write-Host "ERROR: Unexpected failure when setting exit code: $($_.Exception.Message)"
+    Write-Report "ERROR: Unexpected failure when setting exit code: $($_.Exception.Message)"
     exit 4
 }

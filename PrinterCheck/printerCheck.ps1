@@ -1,11 +1,33 @@
 # RMM Printer Check - Display Output Table
 # Lists: Printer Name, Driver Name, Port Name, Port/IP Address
 
-# -------------------------
-# CONFIG (optional)
-# -------------------------
-# Use "*" for all printers, or partial name e.g. "Kyocera*", "KM*"
-$PrinterName = "*"
+[CmdletBinding()]
+param(
+    # Use "*" for all printers, or partial name e.g. "Kyocera*", "KM*"
+    [Parameter()] [string]$PrinterName = "*",
+    [Parameter()] [object]$AsJson
+)
+
+function Convert-ToBool {
+    param([Parameter(ValueFromPipeline)][AllowNull()][object]$Value)
+    process {
+        if ($null -eq $Value) { return $false }
+        if ($Value -is [bool]) { return $Value }
+        if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
+            return [bool]([int]$Value)
+        }
+        $v = "$Value".Trim().ToLowerInvariant()
+        switch ($v) {
+            'true'  { return $true }
+            'false' { return $false }
+            '1'     { return $true }
+            '0'     { return $false }
+            default { return $false }
+        }
+    }
+}
+
+$AsJson = Convert-ToBool $AsJson
 
 try {
     # Get printers (filtered if name pattern set)
@@ -36,6 +58,15 @@ try {
             "Port Name"    = $p.PortName
             "Port Address" = $portAddress
         }
+    }
+
+    if ($AsJson) {
+        [pscustomobject]@{
+            Count    = @($results).Count
+            Filter   = $PrinterName
+            Printers = $results
+        } | ConvertTo-Json -Depth 4
+        exit 0
     }
 
     if (-not $results) {
