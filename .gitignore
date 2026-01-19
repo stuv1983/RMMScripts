@@ -36,6 +36,7 @@ $PSVersionTable
 
 # Specific files to exclude (Per User Request)
 AutoWindows(old).ps1
+AVCheck(beta).ps1
 
 # Common IDE/Editor Configuration
 .vscode/
