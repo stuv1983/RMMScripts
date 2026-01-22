@@ -51,12 +51,26 @@ $ScriptStart = Get-Date
 #   - This is intentionally WARNING (not CRITICAL) to avoid noisy false positives.
 #   - Adjust patterns as required if Bitdefender branding strings change.
 $AllowedAVNamePatterns = @(
+  '(?i)^Managed Antivirus Antimalware$'
   '(?i)^Microsoft Defender Antivirus$'
   '(?i)^Windows Defender$'
   '(?i)Defender'
   '(?i)^BitDefender \(N-able managed\)$'
   '(?i)^BitDefender\b'
   '(?i)Bitdefender'
+)
+
+# -----------------------------------------------------------------------------
+# Managed AV (Bitdefender) detection patterns
+# -----------------------------------------------------------------------------
+# Used to short-circuit Defender health checks when Bitdefender is the intended
+# primary AV for the client. Defender being "off" and signatures "out of date"
+# can be expected when a third-party AV is controlling protection.
+$ManagedAVNamePatterns = @(
+  '(?i)^Managed Antivirus Antimalware$'
+  '(?i)Bitdefender'
+  '(?i)Managed Antivirus'
+  '(?i)Managed AV'
 )
 
 #endregion Globals / Parameters
@@ -129,6 +143,18 @@ function Decode-WscProductState {
     RealtimeEnabled    = $rtEnabled
     SignaturesUpToDate = $sigUpToDate
   }
+}
+
+function Test-NameMatchesAnyPattern {
+  param(
+    [Parameter(Mandatory=$true)][string]$Name,
+    [Parameter(Mandatory=$true)][string[]]$Patterns
+  )
+
+  foreach ($pat in $Patterns) {
+    if ($Name -match $pat) { return $true }
+  }
+  return $false
 }
 
 #endregion Helper Functions
@@ -356,15 +382,36 @@ $products = Get-WSCAVProducts
 $def      = Get-DefenderStatus
 $mde      = Get-MDEStatus
 
+# -----------------------------------------------------------------------------
+# Determine "primary" AV for evaluation purposes
+# -----------------------------------------------------------------------------
+# If managed AV (Bitdefender / N-able Managed AV) is present in WSC inventory, we
+# treat it as authoritative and skip Defender posture checks. This avoids false
+# Critical states when Defender is intentionally disabled by third-party AV.
+$managedProducts = @()
+if ($products -and $products.Count -gt 0) {
+  $managedProducts = @($products | Where-Object { Test-NameMatchesAnyPattern -Name $_.DisplayName -Patterns $ManagedAVNamePatterns })
+}
+
+$IsManagedAVPresent = (@($managedProducts).Count -gt 0)
+Add-Debug ("Main: IsManagedAVPresent={0}; ManagedProducts={1}" -f $IsManagedAVPresent, ($managedProducts.DisplayName -join ', '))
+
 # Determine "active" AV (best effort)
 $activeAV = 'Unknown'
 $realTime = 'Unknown'
 
-if ($def.Present -and $def.ServiceStatus -eq 'Running') {
+if ($IsManagedAVPresent) {
+  # Prefer managed AV as active when present
+  $primary = $managedProducts | Select-Object -First 1
+  $activeAV = $primary.DisplayName
+  $realTime = $(if ($primary.RealTimeEnabled) { 'On' } else { 'On/Unknown' })
+}
+elseif ($def.Present -and $def.ServiceStatus -eq 'Running') {
   $activeAV = 'Microsoft Defender Antivirus'
   $realTime = $(if ($def.RTEnabled) { 'On' } else { 'Off' })
-} elseif ($products -and $products.Count -gt 0) {
-  # Prefer the first WSC product as "active" (WSC doesn't always mark a single "active" reliably)
+}
+elseif ($products -and $products.Count -gt 0) {
+  # Prefer the first WSC product as "active" (‘best effort’ only)
   $activeAV = ($products[0].DisplayName)
   $realTime = $(if ($products[0].RealTimeEnabled) { 'On' } else { 'Off/Unknown' })
 }
@@ -393,10 +440,7 @@ $severity = 'OK'
 $unexpectedAV = @()
 if ($products -and $products.Count -gt 0) {
   foreach ($name in ($products.DisplayName | Where-Object { $_ } | Sort-Object -Unique)) {
-    $isAllowed = $false
-    foreach ($pat in $AllowedAVNamePatterns) {
-      if ($name -match $pat) { $isAllowed = $true; break }
-    }
+    $isAllowed = Test-NameMatchesAnyPattern -Name $name -Patterns $AllowedAVNamePatterns
     if (-not $isAllowed) { $unexpectedAV += $name }
   }
 }
@@ -407,23 +451,32 @@ if ($unexpectedAV.Count -gt 0) {
   if ($severity -ne 'Critical') { $severity = 'Warning' }
 }
 
-# Defender checks unchanged (below)
-# Defender signature / RT checks (only if Defender present)
-if ($def.Present) {
+# -----------------------------------------------------------------------------
+# Managed AV guardrail
+# -----------------------------------------------------------------------------
+# If managed AV is present, we do NOT evaluate Defender signature age / Defender RT
+# status as they are often intentionally disabled by third-party AV.
+if ($IsManagedAVPresent) {
+  [void]$issues.Add((New-Issue -Severity 'Info' -Code 'MANAGED_AV_PRESENT' -Details ("Managed AV detected via WSC: {0}. Skipping Defender posture checks by design." -f ($managedProducts.DisplayName -join ', ')) -Recommendation 'No action required. Ensure Bitdefender policies are applied and up to date.'))
+}
+else {
+  # Defender checks (only if Defender present)
+  if ($def.Present) {
 
-  if ($def.ServiceStatus -ne 'Running') {
-    [void]$issues.Add((New-Issue -Severity 'Critical' -Code 'DEF_SERVICE_STOPPED' -Details "WinDefend service status: $($def.ServiceStatus)" -Recommendation 'Start the WinDefend service and ensure it is not disabled by policy.'))
-    $severity = 'Critical'
-  }
+    if ($def.ServiceStatus -ne 'Running') {
+      [void]$issues.Add((New-Issue -Severity 'Critical' -Code 'DEF_SERVICE_STOPPED' -Details "WinDefend service status: $($def.ServiceStatus)" -Recommendation 'Start the WinDefend service and ensure it is not disabled by policy.'))
+      $severity = 'Critical'
+    }
 
-  if ($def.RTEnabled -eq $false) {
-    [void]$issues.Add((New-Issue -Severity 'Critical' -Code 'DEF_REALTIME_OFF' -Details 'Microsoft Defender real-time protection is disabled.' -Recommendation 'Enable real-time protection via policy or local settings; confirm no third-party AV is disabling it.'))
-    $severity = 'Critical'
-  }
+    if ($def.RTEnabled -eq $false) {
+      [void]$issues.Add((New-Issue -Severity 'Critical' -Code 'DEF_REALTIME_OFF' -Details 'Microsoft Defender real-time protection is disabled.' -Recommendation 'Enable real-time protection via policy or local settings; confirm no third-party AV is disabling it.'))
+      $severity = 'Critical'
+    }
 
-  if ($null -ne $def.SigUpToDate -and $def.SigUpToDate -eq $false) {
-    [void]$issues.Add((New-Issue -Severity 'Warning' -Code 'DEF_SIG_OLD' -Details "Defender signatures appear older than expected (SigAgeHours=$($def.SigAgeHours))." -Recommendation 'Trigger a signature update and confirm endpoint connectivity to update sources.'))
-    if ($severity -ne 'Critical') { $severity = 'Warning' }
+    if ($null -ne $def.SigUpToDate -and $def.SigUpToDate -eq $false) {
+      [void]$issues.Add((New-Issue -Severity 'Warning' -Code 'DEF_SIG_OLD' -Details "Defender signatures appear older than expected (SigAgeHours=$($def.SigAgeHours))." -Recommendation 'Trigger a signature update and confirm endpoint connectivity to update sources.'))
+      if ($severity -ne 'Critical') { $severity = 'Warning' }
+    }
   }
 }
 
