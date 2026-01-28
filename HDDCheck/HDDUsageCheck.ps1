@@ -18,7 +18,7 @@
 
 .NOTES
     Author: Stu (Kenstra IT Support), EN-AU
-    Version: 1.5 (adds exit codes for RMM)
+    Version: 1.6 (adds per-drive Recycle Bin sizing + faster folder sizing)
 #>
 
 [CmdletBinding()]
@@ -27,6 +27,8 @@ param(
     [Parameter()] [string]$UserRoot = 'C:\Users',         # Root for user profiles
     [Parameter()] [int]$LargeThresholdGB = 5,             # Flag any folder/file >= this size
     [Parameter()] [object]$IncludeHidden = $true,         # Include hidden/system items during sizing
+    [Parameter()] [object]$IncludeRecycleBin = $true,    # Include $Recycle.Bin size per drive
+    [Parameter()] [int]$RecycleBinThresholdGB = 5,          # Flag Recycle Bin >= this size (counts as Large items)
     [Parameter()] [object]$AsJson
 )
 
@@ -50,6 +52,7 @@ function Convert-ToBool {
 }
 
 $IncludeHidden = Convert-ToBool $IncludeHidden
+$IncludeRecycleBin = Convert-ToBool $IncludeRecycleBin
 $AsJson = Convert-ToBool $AsJson
 
 function Write-Report {
@@ -68,6 +71,7 @@ $LowSpaceFound    = $false       # Set true if any drive is below threshold
 $LargeItemsFound  = $false       # Set true if any large folder/file found
 
 $driveResults = @()
+$recycleBinResults = @()
 $profileResults = @()
 $largeItemsResults = @()
 
@@ -81,16 +85,43 @@ function To-GB {
 function Get-FolderSizeBytes {
     <#
         Returns recursive size of a folder in bytes.
-        Uses -Force to include hidden/system, and SilentlyContinue to ignore access issues.
+        Uses .NET enumeration for better performance than Get-ChildItem -Recurse.
+        Suppresses access denied and other IO errors.
     #>
     param([Parameter(Mandatory)][string]$Path)
     try {
-        return (Get-ChildItem -Path $Path -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
-                Measure-Object -Property Length -Sum).Sum
+        if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+        $total = 0L
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push($Path)
+
+        while ($stack.Count -gt 0) {
+            $current = $stack.Pop()
+            try {
+                $dirs = [System.IO.Directory]::EnumerateDirectories($current)
+                foreach ($d in $dirs) { $stack.Push($d) }
+
+                $files = [System.IO.Directory]::EnumerateFiles($current)
+                foreach ($f in $files) {
+                    try {
+                        $fi = New-Object System.IO.FileInfo($f)
+                        if (-not $IncludeHidden) {
+                            $attr = $fi.Attributes
+                            if (($attr -band [System.IO.FileAttributes]::Hidden) -ne 0) { continue }
+                            if (($attr -band [System.IO.FileAttributes]::System) -ne 0) { continue }
+                        }
+                        $total += $fi.Length
+                    } catch { }
+                }
+            } catch { }
+        }
+
+        return $total
     } catch {
         return 0
     }
 }
+
 
 # ---------------- DRIVE USAGE ----------------
 Write-Report "=== Hard Drive Usage Report ===`n"
@@ -125,6 +156,50 @@ foreach ($d in $drives) {
     }
 }
 
+
+# ---------------- RECYCLE BIN (PER DRIVE) ----------------
+if ($IncludeRecycleBin) {
+    Write-Report "`n=== Recycle Bin Usage (per drive) ===`n"
+
+    $rbThresholdBytes = [int64]($RecycleBinThresholdGB * 1GB)
+
+    foreach ($d in $drives) {
+        $root = ($d.DeviceID + "\")
+        $rbPath = Join-Path -Path $root -ChildPath '$Recycle.Bin'
+
+        $rbBytes = 0L
+        if (Test-Path -LiteralPath $rbPath) {
+            $rbBytes = Get-FolderSizeBytes -Path $rbPath
+        }
+
+        $rbGB = To-GB $rbBytes
+        $isLarge = ($rbBytes -ge $rbThresholdBytes)
+
+        if ($isLarge) { $LargeItemsFound = $true }
+
+        $row = [pscustomobject]@{
+            Drive              = $d.DeviceID
+            RecycleBinGB       = $rbGB
+            RecycleBinPath     = $rbPath
+            RecycleBinLarge    = $isLarge
+            ThresholdGB        = $RecycleBinThresholdGB
+        }
+
+        $recycleBinResults += $row
+
+        Write-Report ("Drive {0}: Recycle Bin={1} GB (threshold {2} GB)" -f $d.DeviceID, $rbGB, $RecycleBinThresholdGB)
+        if ($isLarge) {
+            Write-Report ("WARNING: {0} Recycle Bin >= {1} GB" -f $d.DeviceID, $RecycleBinThresholdGB) -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $AsJson) {
+        if ($recycleBinResults) {
+            $recycleBinResults | Sort-Object RecycleBinGB -Descending | Format-Table -AutoSize
+        }
+    }
+}
+
 # ---------------- USER PROFILE SIZES ----------------
 if (-not (Test-Path $UserRoot)) {
     Write-Report "`nUser root not found: $UserRoot"
@@ -144,8 +219,7 @@ if (-not (Test-Path $UserRoot)) {
 
     $profileRows = @()
     foreach ($p in $profiles) {
-        $bytes = (Get-ChildItem -Path $p.FullName -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
-                  Measure-Object -Property Length -Sum).Sum
+        $bytes = Get-FolderSizeBytes -Path $p.FullName
         $row = [pscustomobject]@{
             User   = $p.Name
             Path   = $p.FullName
@@ -227,9 +301,12 @@ if ($AsJson) {
         LowSpaceThreshold = $LowSpaceThreshold
         LargeThresholdGB = $LargeThresholdGB
         UserRoot          = $UserRoot
+        IncludeRecycleBin = $IncludeRecycleBin
+        RecycleBinThresholdGB = $RecycleBinThresholdGB
         LowSpaceFound     = $LowSpaceFound
         LargeItemsFound   = $LargeItemsFound
         Drives            = $driveResults
+        RecycleBins       = $recycleBinResults
         Profiles          = $profileResults
         LargeItems        = $largeItemsResults
     } | ConvertTo-Json -Depth 5
