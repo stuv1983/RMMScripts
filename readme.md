@@ -14,7 +14,8 @@ All scripts are **RMM‑friendly** (clear console output + exit codes) and safe 
 - **SecurityCheck.ps1** – Endpoint security posture in one pass (AV/Firewall/Updates/Reboot).  
 - **AutoWindowsUpdate.ps1** – *Basic* Windows Update checker/installer.  
 - **Update-Chrome.ps1** – Updates Google Chrome via Winget with "Pending Reboot" detection.
-- **HDDUsageCheck.ps1** – Lightweight script to check what is using data on C: 
+- **HDDUsageCheck.ps1** – Lightweight script to check what is using data on C:
+- **AutoDiskCleanup** is a production-ready PowerShell automation designed for MSP/RMM environments. It runs Windows Disk Cleanup (`cleanmgr.exe`) **silently**, without user-facing UI, and provides clear **before/after disk space reporting** directly to RMM output.
 
 ---
 
@@ -241,3 +242,132 @@ git push
 
 ## Author
 Developed and maintained by **Stu Villanti** for NOC/MSP automation and patch lifecycle management.
+
+
+
+# AutoDiskCleanup (CleanMgr) – RMM-Safe, Silent Disk Cleanup
+
+## Overview
+**AutoDiskCleanup** is a production-ready PowerShell automation designed for MSP/RMM environments.  
+It runs Windows Disk Cleanup (`cleanmgr.exe`) **silently**, without user-facing UI, and provides clear
+**before/after disk space reporting** directly to RMM output.
+
+Key goals:
+- No end-user disruption
+- Safe to run via RMM / Automation Manager
+- Clear audit output (what ran, when, and what changed)
+- No log files written to the endpoint
+
+---
+
+## Key Features
+- 🔇 Fully hidden execution (runs as SYSTEM via a temporary Scheduled Task)
+- 🧪 Test / Dry-run mode (no changes made)
+- 📊 Disk space BEFORE / AFTER / Delta
+- 🧹 Configurable cleanup categories
+- 🧠 Automatic cleanup of stale scheduled tasks
+- 🧵 RunId correlation for multi-run debugging
+- 🚫 No on-disk logs (stdout only – ideal for RMM capture)
+- 🛡 64-bit safe (avoids WOW6432Node registry redirection)
+
+---
+
+## How It Works
+1. Capture disk free space (BEFORE)
+2. Configure CleanMgr registry StateFlags
+3. Execute `cleanmgr.exe /SAGERUN:<ProfileId>` via hidden SYSTEM task
+4. Wait with heartbeat output
+5. Remove temporary scheduled task
+6. Capture disk free space (AFTER) and report delta
+
+---
+
+## Requirements
+- Windows 10 / 11
+- Windows Server 2016+
+- PowerShell 5.1+
+
+> `cleanmgr.exe` must exist on the OS.
+
+---
+
+## Usage
+
+### Live Run
+```powershell
+.\DiskCleanup.ps1
+```
+
+### Test / Dry-Run
+```powershell
+.\DiskCleanup.ps1 -Mode test
+```
+
+Valid test values: `test`, `check`, `dryrun`
+
+---
+
+## Example Output
+```text
+Disk free space BEFORE:
+  C:: 250.08GB free of 443.53GB (56.4% free)
+[TEST] Would ENABLE category: Temporary Files
+[TEST] Would execute (hidden via task): cleanmgr.exe /SAGERUN:191
+Disk free space AFTER:
+  C:: 250.08GB free of 443.53GB (56.4% free)
+Disk free space delta:
+  C:: +0.00B
+```
+
+---
+
+## Cleanup Categories
+Configured in the `$Categories` array:
+
+- Temporary Files
+- Temporary Setup Files
+- Recycle Bin
+- Windows Error Reporting Files
+- System error memory dump files
+- System error minidump files
+- Update Cleanup
+- Device Driver Packages
+- Old ChkDsk Files
+- Setup Log Files
+- Thumbnail Cache
+
+Missing categories on a given OS are safely skipped.
+
+---
+
+## Safety Notes
+- Runs as SYSTEM
+- No user profile data touched
+- Safe to re-run
+- Mutex prevents concurrent execution
+
+---
+
+## Troubleshooting
+
+Check if cleanup is running:
+```powershell
+Get-Process cleanmgr
+Get-ScheduledTask | Where-Object TaskName -like "DiskCleanup-RMM-*"
+```
+
+Stop cleanup safely:
+```powershell
+Stop-Process -Name cleanmgr -Force
+```
+
+---
+
+## Scheduling Recommendations
+- Weekly: lightweight categories
+- Monthly: include Update Cleanup
+
+---
+
+## License
+Internal / MSP use. Modify as required.
