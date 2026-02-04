@@ -1,0 +1,26 @@
+# Printer details
+$PrintServer = "gp-cq-fs-01"
+$PrinterName = "CQN Head Office"
+$Connection  = "\\$PrintServer\$PrinterName"
+
+try {
+    # Check if printer already exists
+    $existing = Get-Printer -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq $Connection }
+
+    if ($existing) {
+        Write-Output "Printer already installed: $Connection"
+        exit 0
+    }
+
+    # Add the shared printer
+    Add-Printer -ConnectionName $Connection
+
+    Write-Output "Printer successfully added: $Connection"
+    exit 0
+}
+catch {
+    Write-Error "Failed to add printer $Connection"
+    Write-Error $_
+    exit 1
+}
