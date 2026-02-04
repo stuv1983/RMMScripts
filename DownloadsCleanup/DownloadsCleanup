@@ -1,0 +1,362 @@
+#requires -version 5.1
+<#
+.SYNOPSIS
+  RMM-safe Downloads folder audit/cleanup with explicit -Test flag and configurable size threshold.
+
+.DESCRIPTION
+  - Enumerates user Downloads folders (C:\Users\<User>\Downloads) for local profiles.
+  - Calculates total size WITHOUT following reparse points (junctions/symlinks) for safety.
+  - Lists content found (top N largest files) for visibility/audit.
+  - If a Downloads folder exceeds a configured threshold, deletes its CONTENTS (not the folder) when not in TEST mode.
+  - Outputs everything to StdOut (RMM) and to a log file.
+
+  Safety characteristics:
+    - -Test performs NO deletion and logs intended actions with "TEST:" prefix.
+    - Does not traverse reparse points to avoid deleting through redirected paths.
+    - Skips Default/Public/All Users profiles.
+    - Concurrency guard (mutex) prevents overlapping runs.
+    - Continues per-user on access errors; logs warnings instead of failing the whole run.
+
+.PARAMETER Test
+  When present, runs in non-destructive audit mode. Logs "TEST:" for actions that would occur.
+
+.PARAMETER ThresholdGB
+  Threshold (in GB). If a Downloads folder exceeds this size, it is eligible for cleanup.
+
+.PARAMETER MaxFilesToList
+  Maximum number of files listed per Downloads folder (largest first).
+
+.PARAMETER IncludeHidden
+  When set, includes hidden/system files in size and listing.
+
+.PARAMETER LogPath
+  Log file location. Default: %ProgramData%\Kenstra\Logs\DownloadsCleanup.log
+
+.EXAMPLE
+  # Audit only (no deletion), 5GB threshold
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DownloadsCleanup.ps1 -Test -ThresholdGB 5
+
+.EXAMPLE
+  # Run cleanup if Downloads > 10GB
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DownloadsCleanup.ps1 -ThresholdGB 10
+
+.NOTES
+  Recommended to run as LocalSystem via RMM so all local user profiles can be assessed.
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$Test,
+
+    [ValidateRange(0, 10000)]
+    [double]$ThresholdGB = 5,
+
+    [ValidateRange(1, 5000)]
+    [int]$MaxFilesToList = 50,
+
+    [switch]$IncludeHidden,
+
+    [string]$LogPath = "$env:ProgramData\Kenstra\Logs\DownloadsCleanup.log"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# ----------------------------
+# Logging
+# ----------------------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
+    )
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts [$Level] $Message"
+
+    # StdOut (RMM task output)
+    Write-Output $line
+
+    # Log file (best effort)
+    try {
+        $dir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    } catch {
+        Write-Output "$ts [WARN] Logging failure: $($_.Exception.Message)"
+    }
+}
+
+# ----------------------------
+# Concurrency guard (approved verb)
+# ----------------------------
+function New-RunMutex {
+    # PSScriptAnalyzer-approved verb: New-
+    $name = "Global\DownloadsCleanup-Mutex"
+    $mutex = New-Object System.Threading.Mutex($false, $name)
+    try {
+        if (-not $mutex.WaitOne([TimeSpan]::FromSeconds(1))) {
+            throw "Another instance is already running (mutex '$name')."
+        }
+        return $mutex
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+# ----------------------------
+# Helpers: reparse point detection
+# ----------------------------
+function Test-IsReparsePoint {
+    param([Parameter(Mandatory)][System.IO.FileSystemInfo]$Item)
+    return (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Get-DownloadsFolders {
+    <#
+      Finds Downloads folders under C:\Users\<User>\Downloads for local profiles.
+      Skips: Default, Default User, Public, All Users.
+    #>
+    $skip = @('Default','Default User','Public','All Users')
+    $usersRoot = Join-Path $env:SystemDrive 'Users'
+    if (-not (Test-Path -LiteralPath $usersRoot)) { return @() }
+
+    $profiles = Get-ChildItem -LiteralPath $usersRoot -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $skip -notcontains $_.Name }
+
+    $folders = foreach ($p in $profiles) {
+        # Safety: do not follow reparse points at the profile root
+        if (Test-IsReparsePoint -Item $p) {
+            Write-Log "Skipping profile '$($p.FullName)' (reparse point detected)." "WARN"
+            continue
+        }
+
+        $dl = Join-Path $p.FullName 'Downloads'
+        if (Test-Path -LiteralPath $dl) {
+            $dlInfo = Get-Item -LiteralPath $dl -Force -ErrorAction SilentlyContinue
+            if ($dlInfo -and -not (Test-IsReparsePoint -Item $dlInfo)) {
+                [PSCustomObject]@{
+                    UserProfile = $p.FullName
+                    UserName    = $p.Name
+                    Downloads   = $dl
+                }
+            } else {
+                Write-Log "Skipping Downloads for '$($p.Name)' (missing or reparse point)." "WARN"
+            }
+        }
+    }
+    return @($folders)
+}
+
+function New-EnumerationOptionsNoReparse {
+    $opts = New-Object System.IO.EnumerationOptions
+    $opts.RecurseSubdirectories = $true
+    $opts.IgnoreInaccessible = $true
+    # Do not follow junctions/symlinks
+    $opts.AttributesToSkip = [IO.FileAttributes]::ReparsePoint
+    return $opts
+}
+
+function Get-FolderSizeBytes {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $opts = New-EnumerationOptionsNoReparse
+    $total = 0L
+
+    try {
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($Path, '*', $opts)) {
+            try {
+                $fi = New-Object System.IO.FileInfo($file)
+                if (-not $IncludeHidden) {
+                    if (($fi.Attributes -band [IO.FileAttributes]::Hidden) -ne 0) { continue }
+                    if (($fi.Attributes -band [IO.FileAttributes]::System) -ne 0) { continue }
+                }
+                $total += $fi.Length
+            } catch { }
+        }
+    } catch { }
+
+    return $total
+}
+
+function Get-LargestFilesSafe {
+    <#
+      Returns top N largest files without following reparse points.
+      Does a single pass and maintains a small in-memory list (TopN).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$TopN
+    )
+
+    $opts = New-EnumerationOptionsNoReparse
+    $top = New-Object System.Collections.Generic.List[object]
+
+    try {
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($Path, '*', $opts)) {
+            try {
+                $fi = New-Object System.IO.FileInfo($file)
+
+                if (-not $IncludeHidden) {
+                    if (($fi.Attributes -band [IO.FileAttributes]::Hidden) -ne 0) { continue }
+                    if (($fi.Attributes -band [IO.FileAttributes]::System) -ne 0) { continue }
+                }
+
+                $entry = [PSCustomObject]@{
+                    FullName      = $fi.FullName
+                    SizeMB        = [math]::Round($fi.Length / 1MB, 2)
+                    SizeBytes     = [int64]$fi.Length
+                    LastWriteTime = $fi.LastWriteTime
+                }
+
+                if ($top.Count -lt $TopN) {
+                    $top.Add($entry) | Out-Null
+                    continue
+                }
+
+                # Find current smallest in top list
+                $minIdx = 0
+                $minVal = $top[0].SizeBytes
+                for ($i = 1; $i -lt $top.Count; $i++) {
+                    if ($top[$i].SizeBytes -lt $minVal) { $minVal = $top[$i].SizeBytes; $minIdx = $i }
+                }
+
+                if ($entry.SizeBytes -gt $minVal) {
+                    $top[$minIdx] = $entry
+                }
+            } catch { }
+        }
+    } catch { }
+
+    $top | Sort-Object SizeBytes -Descending | Select-Object FullName, SizeMB, LastWriteTime
+}
+
+function Clear-DownloadsContents {
+    <#
+      Deletes contents (files + subfolders) inside Downloads, not the Downloads folder itself.
+      Refuses to delete if Downloads is a reparse point.
+      Skips reparse point children.
+    #>
+    param([Parameter(Mandatory)][string]$DownloadsPath)
+
+    $dlInfo = Get-Item -LiteralPath $DownloadsPath -Force -ErrorAction Stop
+    if (Test-IsReparsePoint -Item $dlInfo) {
+        Write-Log "Refusing to delete: '$DownloadsPath' is a reparse point." "WARN"
+        return $false
+    }
+
+    $children = Get-ChildItem -LiteralPath $DownloadsPath -Force -ErrorAction SilentlyContinue
+    if (-not $children) {
+        Write-Log "Downloads already empty: $DownloadsPath"
+        return $true
+    }
+
+    foreach ($c in $children) {
+        if (Test-IsReparsePoint -Item $c) {
+            Write-Log "Skipping '$($c.FullName)' (reparse point)." "WARN"
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Log "Failed to remove '$($c.FullName)': $($_.Exception.Message)" "WARN"
+        }
+    }
+    return $true
+}
+
+# ----------------------------
+# Main
+# ----------------------------
+$mutex = $null
+$exitCode = 0
+$thresholdBytes = [int64]([math]::Round($ThresholdGB * 1GB))
+
+try {
+    $mutex = New-RunMutex
+
+    Write-Log "==== DownloadsCleanup starting (Test=$($Test.IsPresent), ThresholdGB=$ThresholdGB, MaxFilesToList=$MaxFilesToList) ===="
+    Write-Log "Host: $env:COMPUTERNAME | RunAs: $env:USERNAME | PSVersion: $($PSVersionTable.PSVersion)"
+
+    # Disk free space BEFORE
+    $beforeDisks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+        Select-Object DeviceID,
+            @{n='SizeGB';e={[math]::Round($_.Size/1GB,2)}},
+            @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,2)}},
+            @{n='FreePct';e={ if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace/$_.Size)*100,1) } else { 0 } }}
+
+    Write-Log "Disk free space BEFORE:"
+    $beforeDisks | ForEach-Object {
+        Write-Log ("  {0}: {1}GB free of {2}GB ({3}% free)" -f $_.DeviceID, $_.FreeGB, $_.SizeGB, $_.FreePct)
+    }
+
+    $folders = Get-DownloadsFolders
+    if (-not $folders -or $folders.Count -eq 0) {
+        Write-Log "No eligible Downloads folders found under C:\Users."
+    }
+
+    foreach ($f in $folders) {
+        Write-Log "---- User '$($f.UserName)' Downloads: '$($f.Downloads)' ----"
+
+        $sizeBytes = Get-FolderSizeBytes -Path $f.Downloads
+        $sizeGB = [math]::Round($sizeBytes / 1GB, 2)
+        Write-Log ("Downloads size: {0} GB ({1} bytes)" -f $sizeGB, $sizeBytes)
+
+        # List content found (largest files)
+        $largest = Get-LargestFilesSafe -Path $f.Downloads -TopN $MaxFilesToList
+        if ($largest -and $largest.Count -gt 0) {
+            Write-Log "Largest files (top $MaxFilesToList):"
+            foreach ($item in $largest) {
+                Write-Log ("  {0} | {1} MB | {2}" -f $item.FullName, $item.SizeMB, $item.LastWriteTime)
+            }
+        } else {
+            Write-Log "No files found to list (empty or inaccessible)."
+        }
+
+        if ($sizeBytes -gt $thresholdBytes) {
+            if ($Test) {
+                Write-Log ("TEST: Downloads exceeds threshold ({0}GB). Would clear contents of: {1}" -f $ThresholdGB, $f.Downloads)
+            } else {
+                Write-Log ("Downloads exceeds threshold ({0}GB). Clearing contents of: {1}" -f $ThresholdGB, $f.Downloads)
+                $ok = Clear-DownloadsContents -DownloadsPath $f.Downloads
+                if ($ok) { Write-Log "Cleanup completed for: $($f.Downloads)" }
+                else { Write-Log "Cleanup skipped/failed for: $($f.Downloads)" "WARN" }
+            }
+        } else {
+            Write-Log ("Downloads is below threshold ({0}GB). No action." -f $ThresholdGB)
+        }
+    }
+
+    # Disk free space AFTER
+    $afterDisks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+        Select-Object DeviceID,
+            @{n='SizeGB';e={[math]::Round($_.Size/1GB,2)}},
+            @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,2)}},
+            @{n='FreePct';e={ if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace/$_.Size)*100,1) } else { 0 } }}
+
+    Write-Log "Disk free space AFTER:"
+    $afterDisks | ForEach-Object {
+        Write-Log ("  {0}: {1}GB free of {2}GB ({3}% free)" -f $_.DeviceID, $_.FreeGB, $_.SizeGB, $_.FreePct)
+    }
+
+    foreach ($d in $beforeDisks) {
+        $m = $afterDisks | Where-Object { $_.DeviceID -eq $d.DeviceID } | Select-Object -First 1
+        if ($m) {
+            $delta = [math]::Round(($m.FreeGB - $d.FreeGB), 2)
+            Write-Log ("Delta {0}: {1}GB" -f $d.DeviceID, $delta)
+        }
+    }
+
+    Write-Log "==== DownloadsCleanup completed successfully ===="
+    $exitCode = 0
+}
+catch {
+    Write-Log "DownloadsCleanup failed: $($_.Exception.Message)" "ERROR"
+    Write-Log $_.ScriptStackTrace "ERROR"
+    $exitCode = 1
+}
+finally {
+    if ($mutex) { try { $mutex.ReleaseMutex() } catch { } ; $mutex.Dispose() }
+    exit $exitCode
+}
