@@ -1,0 +1,183 @@
+<#
+.SYNOPSIS
+    Test script to detect and update Mozilla Firefox and Microsoft Office via PowerShell.
+
+.DESCRIPTION
+    This script is a controlled test used to validate that Firefox and Microsoft Office can be
+    reliably detected, assessed, and updated when executed under elevated (SYSTEM/admin) context
+    (e.g. via RMM).
+
+    The script supports two modes:
+      - CheckOnly (default): Detection and reporting only, no changes made.
+      - Update (-Update): Executes update actions to prove remediation capability.
+
+    Firefox detection is performed using the installed executable file version
+    (C:\Program Files\Mozilla Firefox\firefox.exe) as the authoritative source,
+    avoiding unreliable software inventory or stale uninstall registry entries.
+
+    Office detection uses the Click-to-Run configuration registry keys to report
+    VersionToReport and UpdateChannel, and can trigger a Click-to-Run update check.
+
+
+.PARAMETER Update
+    Enables update mode.
+    - Firefox: Downloads and silently installs the specified official Mozilla release
+      as an in-place upgrade.
+    - Office: Triggers the Click-to-Run update process.
+    If not specified, the script runs in CheckOnly mode.
+
+.NOTES
+    Script Name : updateChromeAndOffice.ps1
+    Purpose     : Test / proof-of-concept only
+    Context     : Intended to run under elevated privileges (SYSTEM/admin)
+    User Impact : No user interaction required
+    Safety      : CheckOnly mode is default to prevent accidental remediation
+
+#>
+
+
+param(
+  [switch]$CheckOnly,
+  [switch]$Update
+)
+
+if (-not $Update) { $CheckOnly = $true }
+
+# ===== Config =====
+$TargetFirefoxVersion = "147.0.2"
+$MinOfficeVersion     = [version]"16.0.16130.20306"
+
+Write-Output ("Mode : {0}" -f ($(if ($CheckOnly) { "CheckOnly" } else { "Update" })))
+Write-Output "----------------------------------------"
+
+function Get-FirefoxExePath {
+  if (Test-Path "C:\Program Files\Mozilla Firefox\firefox.exe") { return "C:\Program Files\Mozilla Firefox\firefox.exe" }
+  if (Test-Path "C:\Program Files (x86)\Mozilla Firefox\firefox.exe") { return "C:\Program Files (x86)\Mozilla Firefox\firefox.exe" }
+  return $null
+}
+
+function Get-FirefoxVersion {
+  param([string]$ExePath)
+  if (-not $ExePath) { return $null }
+  try { return (Get-Item $ExePath).VersionInfo.ProductVersion } catch { return $null }
+}
+
+function Download-File {
+  param([string]$Url, [string]$OutFile)
+  try {
+    (New-Object System.Net.WebClient).DownloadFile($Url, $OutFile)
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Install-Firefox {
+  param([string]$InstallerPath)
+  if (-not (Test-Path $InstallerPath)) { return $false }
+  Start-Process $InstallerPath -ArgumentList "/S" -Wait
+  return $true
+}
+
+# ===== Firefox =====
+$ffExe = Get-FirefoxExePath
+$ffVerBefore = Get-FirefoxVersion -ExePath $ffExe
+
+Write-Output ("Firefox_ExePath          : {0}" -f ($(if ($ffExe) { $ffExe } else { "" })))
+Write-Output ("Firefox_Version_Before   : {0}" -f ($(if ($ffVerBefore) { $ffVerBefore } else { "" })))
+
+if (-not $ffExe) {
+  Write-Output "Firefox_Status           : NotInstalled"
+  Write-Output "Firefox_UpdateAttempted  : No"
+} else {
+  Write-Output "Firefox_Status           : Installed"
+
+  if (-not $CheckOnly) {
+    # Decide architecture based on install path
+    $isX64 = ($ffExe -like "C:\Program Files\*")
+    $arch  = $(if ($isX64) { "win64" } else { "win32" })
+
+    # Official Mozilla release path
+    $fileName = "Firefox Setup $TargetFirefoxVersion.exe"
+    $url = "https://ftp.mozilla.org/pub/firefox/releases/$TargetFirefoxVersion/$arch/en-US/$fileName"
+
+    $installer = Join-Path $env:TEMP $fileName
+
+    Write-Output "Firefox_UpdateAttempted  : Yes"
+    Write-Output ("Firefox_DownloadUrl      : {0}" -f $url)
+    Write-Output ("Firefox_InstallerPath    : {0}" -f $installer)
+
+    $dl = Download-File -Url $url -OutFile $installer
+    Write-Output ("Firefox_Downloaded       : {0}" -f ($(if ($dl) { "Yes" } else { "No" })))
+
+    if ($dl) {
+      $inst = Install-Firefox -InstallerPath $installer
+      Write-Output ("Firefox_InstallLaunched  : {0}" -f ($(if ($inst) { "Yes" } else { "No" })))
+      Start-Sleep -Seconds 3
+    } else {
+      Write-Output "Firefox_InstallLaunched  : No"
+    }
+
+    $ffVerAfter = Get-FirefoxVersion -ExePath $ffExe
+    Write-Output ("Firefox_Version_After    : {0}" -f ($(if ($ffVerAfter) { $ffVerAfter } else { "" })))
+  } else {
+    Write-Output "Firefox_UpdateAttempted  : No"
+  }
+}
+
+Write-Output "----------------------------------------"
+
+# ===== Office (Click-to-Run) =====
+function Get-OfficeVersionRaw {
+  $path = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+  if (Test-Path $path) { return (Get-ItemProperty $path -EA SilentlyContinue).VersionToReport }
+  return $null
+}
+
+function Parse-VersionSafe {
+  param([string]$Text)
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  $m = [regex]::Match($Text, '\d+(\.\d+){1,3}')
+  if (-not $m.Success) { return $null }
+  try { return [version]$m.Value } catch { return $null }
+}
+
+function Get-OfficeChannel {
+  $path = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+  if (Test-Path $path) { return (Get-ItemProperty $path -EA SilentlyContinue).UpdateChannel }
+  return $null
+}
+
+function Update-Office {
+  $exe = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe"
+  if (Test-Path $exe) {
+    Start-Process $exe -ArgumentList "/update user displaylevel=false forceappshutdown=true" -Wait
+    return $true
+  }
+  return $false
+}
+
+$ovRaw = Get-OfficeVersionRaw
+$ov = Parse-VersionSafe $ovRaw
+$chan = Get-OfficeChannel
+
+Write-Output ("Office_VersionRaw        : {0}" -f ($(if ($ovRaw) { $ovRaw } else { "" })))
+Write-Output ("Office_UpdateChannel     : {0}" -f ($(if ($chan) { $chan } else { "" })))
+
+if (-not $ovRaw) {
+  Write-Output "Office_Status            : NotInstalled"
+  Write-Output "Office_UpdateAttempted   : No"
+} else {
+  Write-Output "Office_Status            : Installed"
+  Write-Output ("Office_MinSafeStatus     : {0}" -f ($(if ($ov -and $ov -lt $MinOfficeVersion) { "BelowMinimumSafe" } else { "AtOrAboveMinimumSafe" })))
+
+  if (-not $CheckOnly) {
+    Write-Output "Office_UpdateAttempted   : Yes"
+    Write-Output ("Office_UpdateLaunched    : {0}" -f ($(if (Update-Office) { "Yes" } else { "No" })))
+  } else {
+    Write-Output "Office_UpdateAttempted   : No"
+  }
+}
+
+Write-Output "----------------------------------------"
+Write-Output "Script Complete"
