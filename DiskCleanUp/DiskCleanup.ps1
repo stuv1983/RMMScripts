@@ -3,6 +3,11 @@
 .SYNOPSIS
   Automated Windows Disk Cleanup (CleanMgr) for RMM - Zero UI (Session 0).
 
+  .NOTES
+    Name:       DiskCleanup.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    3.0.
+    
 .DESCRIPTION
   - Configures Disk Cleanup categories via registry StateFlags.
   - Runs cleanmgr.exe via a temporary Scheduled Task as SYSTEM.

@@ -3,28 +3,31 @@
 .SYNOPSIS
   RMM-safe Downloads folder audit/cleanup with explicit -Test flag and configurable size threshold.
 
+
+.NOTES
+    Name:       DownloadCleanup.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    2.0.
+
 .DESCRIPTION
   - Enumerates user Downloads folders (C:\Users\<User>\Downloads) for local profiles.
-  - Calculates total size WITHOUT following reparse points (junctions/symlinks) for safety.
   - Lists content found (top N largest files) for visibility/audit.
   - If a Downloads folder exceeds a configured threshold, deletes its CONTENTS (not the folder) when not in TEST mode.
-  - Outputs everything to StdOut (RMM) and to a log file.
+  - Outputs everything to RMM
 
-  Safety characteristics:
+  Safety:
     - -Test performs NO deletion and logs intended actions with "TEST:" prefix.
     - Does not traverse reparse points to avoid deleting through redirected paths.
     - Skips Default/Public/All Users profiles.
-    - Concurrency guard (mutex) prevents overlapping runs.
-    - Continues per-user on access errors; logs warnings instead of failing the whole run.
 
 .PARAMETER Test
-  When present, runs in non-destructive audit mode. Logs "TEST:" for actions that would occur.
+  Logs "TEST:" for actions that would occur.
 
 .PARAMETER ThresholdGB
-  Threshold (in GB). If a Downloads folder exceeds this size, it is eligible for cleanup.
+ If a Downloads folder exceeds this size, it is eligible for cleanup.
 
 .PARAMETER MaxFilesToList
-  Maximum number of files listed per Downloads folder (largest first).
+  Maximum number of files listed per Downloads folder.
 
 .PARAMETER IncludeHidden
   When set, includes hidden/system files in size and listing.
@@ -32,16 +35,6 @@
 .PARAMETER LogPath
   Log file location. Default: %ProgramData%\Kenstra\Logs\DownloadsCleanup.log
 
-.EXAMPLE
-  # Audit only (no deletion), 5GB threshold
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DownloadsCleanup.ps1 -Test -ThresholdGB 5
-
-.EXAMPLE
-  # Run cleanup if Downloads > 10GB
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DownloadsCleanup.ps1 -ThresholdGB 10
-
-.NOTES
-  Recommended to run as LocalSystem via RMM so all local user profiles can be assessed.
 #>
 
 [CmdletBinding()]

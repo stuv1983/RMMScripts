@@ -2,6 +2,12 @@
 .SYNOPSIS
     Hard drive usage + per-user profile sizing + large folder/file reporting (RMM-ready), with per-drive Recycle Bin sizing.
 
+
+.NOTES
+    Name:       HDDCheck.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    5.0
+
 .DESCRIPTION
     - Reports used/free space for all fixed drives.
     - Reports per-drive Recycle Bin usage (X:\$Recycle.Bin).
@@ -11,24 +17,12 @@
     - Console-only output (no disk writes). ASCII-only to avoid encoding issues.
     - Returns exit codes suitable for RMM alerting.
 
-.ARCHITECTURE NOTE
-    Single traversal per profile:
-      The script enumerates files under each profile once and simultaneously computes:
-        - Profile total bytes
-        - Aggregated bytes per top-level folder
-        - Large files list (optional)
-      This removes redundant recursive scans and reduces disk I/O significantly.
-
 .EXIT CODES
     0 = OK            (no low space, no large items)
     1 = Low space     (one or more drives below threshold)
     2 = Large items   (one or more folders/files >= threshold, incl. Recycle Bin threshold)
     3 = Both issues   (low space AND large items detected)
     4 = Script error  (unexpected failure)
-
-.NOTES
-    Author: Stu (Kenstra IT Support), EN-AU
-    Version: 1.7 (single-pass profile traversal + per-drive Recycle Bin sizing)
 #>
 
 [CmdletBinding()]

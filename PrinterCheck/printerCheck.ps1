@@ -1,21 +1,76 @@
-# RMM Printer Check - Display Output Table
-# Lists: Printer Name, Driver Name, Port Name, Port/IP Address
+<#
+.SYNOPSIS
+    printerCheck.ps1 - RMM Printer Inventory / Health Check
+
+.NOTES
+    Name:       GP-PaperCutPrinter.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    1.0
+
+.DESCRIPTION
+    Enumerates installed printers on a Windows endpoint and outputs a tidy table suitable for
+    N-able / RMM "Display Output" panes.
+
+    For each printer, reports:
+      - Printer Name
+      - Driver Name
+      - Port Name
+      - Port Address (PrinterHostAddress or DeviceURL when available)
+
+    Supports:
+      - Wildcard filtering by printer name (default "*")
+      - Optional JSON output for easier parsing by tooling
+
+.PARAMETER PrinterName
+    Wildcard filter for printer names. Examples:
+      - "*" (default)        -> all printers
+      - "Kyocera*"           -> printers starting with "Kyocera"
+      - "*Reception*"        -> printers containing "Reception"
+
+.PARAMETER AsJson
+    When True/1, outputs structured JSON instead of a formatted table.
+
+.OUTPUTS
+    - Default: human-readable table (Write-Output)
+    - JSON mode: JSON string
+
+#>
 
 [CmdletBinding()]
 param(
     # Use "*" for all printers, or partial name e.g. "Kyocera*", "KM*"
-    [Parameter()] [string]$PrinterName = "*",
-    [Parameter()] [object]$AsJson
+    [Parameter()]
+    [string]$PrinterName = "*",
+
+    # RMM tasks often pass parameters as strings/objects; accept anything and convert to boolean.
+    [Parameter()]
+    [object]$AsJson
 )
 
 function Convert-ToBool {
-    param([Parameter(ValueFromPipeline)][AllowNull()][object]$Value)
+    <#
+    .SYNOPSIS
+        Converts common truthy/falsey inputs to [bool].
+
+    .DESCRIPTION
+        RMM systems often pass parameters as strings (e.g. "True"/"False", "1"/"0").
+        This helper normalises those values into a real boolean.
+    #>
+    param(
+        [Parameter(ValueFromPipeline)]
+        [AllowNull()]
+        [object]$Value
+    )
     process {
         if ($null -eq $Value) { return $false }
         if ($Value -is [bool]) { return $Value }
+
+        # Numeric values: 0 -> False, non-zero -> True
         if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
             return [bool]([int]$Value)
         }
+
+        # Strings: handle common cases
         $v = "$Value".Trim().ToLowerInvariant()
         switch ($v) {
             'true'  { return $true }
@@ -27,31 +82,47 @@ function Convert-ToBool {
     }
 }
 
+# Normalise AsJson to a real boolean
 $AsJson = Convert-ToBool $AsJson
 
 try {
-    # Get printers (filtered if name pattern set)
+    # ---------------------------------------------
+    # 1) Collect printers (filtered by wildcard)
+    # ---------------------------------------------
     $printers = Get-Printer -Name $PrinterName -ErrorAction Stop
 
-    # Get all ports once and index by name for quick lookup
-    $ports = Get-PrinterPort | Group-Object -Property Name -AsHashTable -AsString
+    # ---------------------------------------------
+    # 2) Collect ports once, index by port name
+    #    (faster than calling Get-PrinterPort per printer)
+    # ---------------------------------------------
+    $ports = Get-PrinterPort -ErrorAction Stop | Group-Object -Property Name -AsHashTable -AsString
 
+    # ---------------------------------------------
+    # 3) Build result objects for output
+    # ---------------------------------------------
     $results = foreach ($p in $printers) {
+        # Attempt to find the port object for this printer
         $portObj = $null
         if ($ports.ContainsKey($p.PortName)) {
             $portObj = $ports[$p.PortName]
         }
 
-        # Try to get IP/host address if available (TCP/IP or WSD with data)
+        # Determine an "address" for the port:
+        # - TCP/IP ports commonly populate PrinterHostAddress
+        # - WSD ports may populate DeviceURL
+        # - Local ports will not have either
         $portAddress = $null
         if ($portObj -and $portObj.PrinterHostAddress) {
             $portAddress = $portObj.PrinterHostAddress
-        } elseif ($portObj -and $portObj.DeviceURL) {
+        }
+        elseif ($portObj -and $portObj.DeviceURL) {
             $portAddress = $portObj.DeviceURL
-        } else {
+        }
+        else {
             $portAddress = "(No IP / WSD / Local)"
         }
 
+        # Output object (easy to sort / format / convert to JSON)
         [PSCustomObject]@{
             "Printer Name" = $p.Name
             "Driver Name"  = $p.DriverName
@@ -60,6 +131,9 @@ try {
         }
     }
 
+    # ---------------------------------------------
+    # 4) JSON output mode (for parsing)
+    # ---------------------------------------------
     if ($AsJson) {
         [pscustomobject]@{
             Count    = @($results).Count
@@ -69,12 +143,15 @@ try {
         exit 0
     }
 
+    # ---------------------------------------------
+    # 5) Human-readable table output mode (RMM)
+    # ---------------------------------------------
     if (-not $results) {
         Write-Output "No printers found matching filter '$PrinterName'."
         exit 1
     }
 
-    # Nice table for RMM Display Output
+    # Format as a clean table for RMM Display Output
     $table = $results |
         Sort-Object 'Printer Name' |
         Format-Table -AutoSize |
@@ -87,6 +164,7 @@ try {
     exit 0
 }
 catch {
+    # Fail safe: emit the exception message so it’s visible in the RMM output
     Write-Output "ERROR: $($_.Exception.Message)"
     exit 1
 }

@@ -2,6 +2,13 @@
 .SYNOPSIS
   AVCheck.ps1 — Endpoint antivirus and Microsoft Defender health check.
 
+
+.NOTES
+    Name:       AVCheck(beta).ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Date:       YYYY-MM-DD
+    Version:    1.0
+
 .DESCRIPTION
   Provides an RMM-friendly full (multi-line) output by default, plus optional JSON output for ingestion.
 
@@ -11,12 +18,6 @@
     3) Microsoft Defender Antivirus posture (via Get-MpComputerStatus)
     4) Scan recency (quick/full) for Defender if timestamps available
     5) Defender for Endpoint (MDE) Sense service presence/onboarding hints (best effort)
-
-.NOTES
-  - WSC (root\SecurityCenter2) productState decoding is not consistently documented across
-    vendors/OS versions. This script treats derived RT/definition status as hints only
-    and preserves raw/hex values for auditability.
-  - Intended for MSP/RMM use: stable output and predictable exit codes.
 
 #>
 
@@ -37,10 +38,6 @@ $ScriptStart = Get-Date
 # -----------------------------------------------------------------------------
 # Allowed AV list (maintenance-friendly)
 # -----------------------------------------------------------------------------
-# Purpose:
-#   In our environment, endpoints should only have Microsoft Defender Antivirus
-#   and BitDefender (N-able managed). We still enumerate WSC products to detect
-#   unexpected/leftover third-party AV installs (e.g., consumer AV, legacy agents).
 #
 # How it works:
 #   - Windows Security Center (WSC) reports installed AV products in root\SecurityCenter2.

@@ -1,27 +1,23 @@
 <#
 .SYNOPSIS
-    Windows Update helper for RMM use. Clean non-admin version.
+    Windows Update helper for RMM use. 
 
-.DESCRIPTION
-    - Designed for RMMs passing parameters as strings ("true"/"false").
-    - REMOVED: All calls to Start-Service and explicit service checks to allow for non-elevated scans.
-    - Two modes:
-        * CheckOnly: Scans for available updates. Designed to work without Admin rights.
-        * Install  : Scans, downloads, and installs updates. REQUIRES Admin rights (will fail without them).
-    - Prints clear RESULT lines for dashboards/ticket notes.
-    - Returns standard exit codes for policy/alert handling (see Exit Codes).
+.NOTES
+    Name:       AutoWindowUpdate.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    1.0
 
 .PARAMETER CheckOnly
     String/Boolean. If true, only performs a scan and reports findings. Mutually exclusive with -Install.
 
 .PARAMETER Install
-    String/Boolean. If true, scans and installs updates. Mutually exclusive with -CheckOnly.
+   If true, scans and installs updates. Mutually exclusive with -CheckOnly.
 
 .PARAMETER AutoReboot
-    String/Boolean. If true (and Install is true), the script will reboot automatically when required (Requires Admin).
+    If true (and Install is true), the script will reboot automatically when required (Requires Admin).
 
 .PARAMETER VerboseOutput
-    String/Boolean. If true, enables detailed progress messages (Write-Verbose).
+   If true, enables detailed progress messages (Write-Verbose).
 
 .EXIT CODES
     0  - Success. No updates available and no reboot required.

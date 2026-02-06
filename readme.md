@@ -371,3 +371,86 @@ Stop-Process -Name cleanmgr -Force
 
 ## License
 Internal / MSP use. Modify as required.
+
+---
+
+## 🔄 Update-Only Scripts (Paired with Check Scripts)
+
+The repository now includes **update-only scripts** designed to be paired with the existing
+check/audit scripts. This keeps monitoring and remediation **explicitly separated**, which
+works far better with N-able templates and avoids accidental changes during audits.
+
+### Design Principles
+- **Checks** = detect & report only  
+- **Updates** = perform updates only  
+- **Shared output schema** = same key names between check and update scripts  
+- **No forced app closures by default** (user-safe during business hours)
+
+---
+
+### Google Chrome
+- **Check:** `chromeCheckUpdate.ps1`
+- **Update:** `UpdateChrome.ps1`
+
+Behaviour:
+- Uses **Chrome Enterprise MSI**
+- Does **not** force-close Chrome
+- Update may stage; new version becomes active after Chrome restart
+
+Key output fields (unchanged between check/update):
+```
+Chrome_Installed
+Chrome_Version
+Chrome_Source
+```
+
+---
+
+### Mozilla Firefox
+- **Check:** `firefoxCheckUpdate.ps1`
+- **Update:** `UpdateFirefox.ps1`
+
+Behaviour:
+- Uses official Mozilla latest installer (win64)
+- Does **not** force-close Firefox
+- Update may stage or apply after restart depending on locks / maintenance service
+
+Key output fields:
+```
+Firefox_Installed
+Firefox_Version
+Firefox_Source
+```
+
+---
+
+### Microsoft Office (Click-to-Run)
+- **Check:** `officeCheckUpdate.ps1`
+- **Update:** `UpdateOfficeC2R.ps1`
+
+Behaviour:
+- Triggers update via `OfficeC2RClient.exe`
+- **Never force-closes Office apps by default**
+- Updates typically **stage** and apply when apps close or on reboot
+
+Key output fields:
+```
+Office_ClickToRun_Installed
+Office_VersionToReport
+Office_UpdateChannel
+Office_CDNBaseUrl
+Office_Platform
+```
+
+> ℹ️ Update scripts may emit additional informational fields
+> (e.g. `*_Version_Before`, `*_UpdateResult`) which are safe to ignore in N-able parsing.
+
+---
+
+## Recommended Workflow (N-able)
+1. Run **check scripts** on schedule (hourly/daily)
+2. Alert only on **non-compliant states**
+3. Trigger **update scripts** as a remediation action
+4. Re-check on next monitor run
+
+This keeps dashboards clean and avoids false positives during active user sessions.

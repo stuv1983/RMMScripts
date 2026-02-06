@@ -1,6 +1,6 @@
 <# 
 .SYNOPSIS
-    Google Chrome Update & Audit Script (Pending Reboot Edition)
+    Google Chrome Update & Audit Script
     
 .DESCRIPTION
     Updates Google Chrome using Winget but prioritizes detecting "Pending Reboot" states.
@@ -8,7 +8,7 @@
     
 .NOTES
     Author:     Stu Villanti
-    Email:      stuart.villanti@gmail.com
+    Email:      s.villanti@kenstra.com.au
     Created:    2025-12-10
     Version:    1.4
     

@@ -13,10 +13,9 @@
     5) Defender for Endpoint (MDE) Sense service presence/onboarding hints (best effort)
 
 .NOTES
-  - WSC (root\SecurityCenter2) productState decoding is not consistently documented across
-    vendors/OS versions. This script treats derived RT/definition status as hints only
-    and preserves raw/hex values for auditability.
-  - Intended for MSP/RMM use: stable output and predictable exit codes.
+    Name:       AVCheck.ps1
+    Author:     Stu Villanti (s.villanti@kenstra.com.au)
+    Version:    5.0.
 
 #>
 
@@ -35,21 +34,9 @@ $script:DebugBuffer = New-Object System.Collections.Generic.List[string]
 $ScriptStart = Get-Date
 
 # -----------------------------------------------------------------------------
-# Allowed AV list (maintenance-friendly)
+# Allowed AV list 
 # -----------------------------------------------------------------------------
-# Purpose:
-#   In our environment, endpoints should only have Microsoft Defender Antivirus
-#   and BitDefender (N-able managed). We still enumerate WSC products to detect
-#   unexpected/leftover third-party AV installs (e.g., consumer AV, legacy agents).
-#
-# How it works:
-#   - Windows Security Center (WSC) reports installed AV products in root\SecurityCenter2.
-#   - We compare product DisplayName values against allowed regex patterns.
-#   - Any non-allowed products are flagged as a WARNING issue: UNEXPECTED_AV_INSTALLED.
-#
-# Notes:
-#   - This is intentionally WARNING (not CRITICAL) to avoid noisy false positives.
-#   - Adjust patterns as required if Bitdefender branding strings change.
+
 $AllowedAVNamePatterns = @(
   '(?i)^Managed Antivirus Antimalware$'
   '(?i)^Microsoft Defender Antivirus$'
