@@ -1,26 +1,26 @@
 <#
 .SYNOPSIS
-    Hard drive usage + per-user profile sizing + large folder/file reporting (RMM-ready), with per-drive Recycle Bin sizing.
-
+    Hard drive usage + per-user profile sizing + large folder/file reporting (RMM-ready).
+    Now includes specific alerting for User Downloads folders > 5GB.
 
 .NOTES
-    Name:       HDDCheck.ps1
+    Name:       HDDUsageCheck_v2.ps1
     Author:     Stu Villanti (s.villanti@kenstra.com.au)
-    Version:    5.0
+    Modified:   Specific Downloads Check Added
+    Version:    5.1
 
 .DESCRIPTION
     - Reports used/free space for all fixed drives.
-    - Reports per-drive Recycle Bin usage (X:\$Recycle.Bin).
+    - Reports per-drive Recycle Bin usage.
     - Lists each user profile under C:\Users with total size.
-    - For each user, reports top-level folders whose *aggregated* size >= threshold (single traversal).
-    - Optionally reports individual files >= threshold (found during the same traversal).
-    - Console-only output (no disk writes). ASCII-only to avoid encoding issues.
-    - Returns exit codes suitable for RMM alerting.
+    - Checks User "Downloads" folder specifically against a 5GB threshold.
+    - Reports other top-level folders/files >= general threshold.
+    - Console-only output. Returns exit codes for RMM alerting.
 
 .EXIT CODES
-    0 = OK            (no low space, no large items)
-    1 = Low space     (one or more drives below threshold)
-    2 = Large items   (one or more folders/files >= threshold, incl. Recycle Bin threshold)
+    0 = OK            (no issues)
+    1 = Low space     (drive free space < threshold)
+    2 = Large items   (Downloads > 5GB OR other large folders/files found)
     3 = Both issues   (low space AND large items detected)
     4 = Script error  (unexpected failure)
 #>
@@ -29,15 +29,16 @@
 param(
     [Parameter()] [int]$LowSpaceThreshold = 10,              # Warn if drive free % < this
     [Parameter()] [string]$UserRoot = 'C:\Users',            # Root for user profiles
-    [Parameter()] [int]$LargeThresholdGB = 5,                # Flag any folder/file >= this size (GB)
-    [Parameter()] [object]$IncludeHidden = $true,            # Include hidden/system items during enumeration
+    [Parameter()] [int]$LargeThresholdGB = 5,                # General flag for ANY folder/file >= this size (GB)
+    [Parameter()] [int]$DownloadsThresholdGB = 5,            # Specific alert threshold for Downloads folder (GB)
+    [Parameter()] [object]$IncludeHidden = $true,            # Include hidden/system items
     [Parameter()] [object]$AsJson,
 
     # Recycle Bin sizing
     [Parameter()] [object]$IncludeRecycleBin = $true,
-    [Parameter()] [int]$RecycleBinThresholdGB = 5,           # Flag Recycle Bin if >= this size (GB)
+    [Parameter()] [int]$RecycleBinThresholdGB = 5,
 
-    # Large-file reporting (kept for backward compatibility; still single-pass)
+    # Large-file reporting
     [Parameter()] [object]$IncludeLargeFiles = $true
 )
 
@@ -84,6 +85,7 @@ $driveResults       = @()
 $recycleBinResults  = @()
 $profileResults     = @()
 $largeItemsResults  = @()
+$downloadsResults   = @()
 
 # ---------------- HELPERS ----------------
 function To-GB {
@@ -93,10 +95,6 @@ function To-GB {
 }
 
 function Get-FolderSizeBytes {
-    <#
-        Returns recursive size of a folder in bytes.
-        Uses -Force to include hidden/system (optional) and SilentlyContinue to ignore access issues.
-    #>
     param([Parameter(Mandatory)][string]$Path)
     try {
         return (Get-ChildItem -Path $Path -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
@@ -107,20 +105,15 @@ function Get-FolderSizeBytes {
 }
 
 function Get-TopLevelNameFromProfilePath {
-    <#
-        Given a file full path and the profile root path (C:\Users\<user>),
-        returns the top-level folder name under the profile, or '(root)' if file is directly under the profile root.
-    #>
     param(
         [Parameter(Mandatory)][string]$ProfilePath,
         [Parameter(Mandatory)][string]$FileFullPath
     )
-
     try {
         $rel = $FileFullPath.Substring($ProfilePath.Length).TrimStart('\')
         if ([string]::IsNullOrWhiteSpace($rel)) { return '(root)' }
         $parts = $rel.Split('\')
-        if ($parts.Count -ge 2) { return $parts[0] }  # inside a top-level folder
+        if ($parts.Count -ge 2) { return $parts[0] }
         return '(root)'
     } catch {
         return '(unknown)'
@@ -128,16 +121,6 @@ function Get-TopLevelNameFromProfilePath {
 }
 
 function Get-ProfileStatsSinglePass {
-    <#
-        Enumerates files under a profile ONCE and computes:
-          - TotalBytes
-          - BytesByTopFolder (Hashtable)
-          - LargeFiles (Array, optional)
-
-        Implementation note:
-          - Uses streaming pipeline enumeration (no $files array) to keep memory usage flat on very large profiles.
-          - This is NOT ForEach-Object -Parallel, so variable updates (e.g. $total += ...) are safe.
-    #>
     param(
         [Parameter(Mandatory)][string]$User,
         [Parameter(Mandatory)][string]$ProfilePath,
@@ -171,9 +154,7 @@ function Get-ProfileStatsSinglePass {
                 }) | Out-Null
             }
         }
-    } catch {
-        # Best-effort: return what we have, don't hard-fail for one profile
-    }
+    } catch { }
 
     return [pscustomobject]@{
         User             = $User
@@ -218,16 +199,14 @@ foreach ($d in $drives) {
     }
 }
 
-# ---------------- RECYCLE BIN (PER DRIVE) ----------------
+# ---------------- RECYCLE BIN ----------------
 if ($IncludeRecycleBin) {
     $rbThresholdBytes = [int64]($RecycleBinThresholdGB * 1GB)
-
     Write-Report "`n=== Recycle Bin Usage (per drive) ===`n"
 
     foreach ($d in $drives) {
         $root = $d.DeviceID.TrimEnd('\') + '\'
         $rbPath = Join-Path $root '$Recycle.Bin'
-
         $rbBytes = 0
         $rbLarge = $false
 
@@ -244,112 +223,107 @@ if ($IncludeRecycleBin) {
             RecycleBinGB     = To-GB $rbBytes
             RecycleBinPath   = $rbPath
             RecycleBinLarge  = $rbLarge
-            ThresholdGB      = $RecycleBinThresholdGB
         }
         $recycleBinResults += $rbObj
 
-        Write-Report ("Drive {0}: Recycle Bin={1} GB (threshold {2} GB)" -f $d.DeviceID, (To-GB $rbBytes), $RecycleBinThresholdGB)
-
+        Write-Report ("Drive {0}: Recycle Bin={1} GB" -f $d.DeviceID, (To-GB $rbBytes))
         if ($rbLarge) {
             Write-Report ("WARNING: {0} Recycle Bin >= {1} GB" -f $d.DeviceID, $RecycleBinThresholdGB) -ForegroundColor Yellow
         }
     }
-
-    if (-not $AsJson -and $recycleBinResults.Count -gt 0) {
-        Write-Report ""
-        $recycleBinResults | Format-Table -AutoSize
-        Write-Report ""
-    }
 }
 
-# ---------------- USER PROFILE SIZES + LARGE ITEMS (SINGLE PASS PER PROFILE) ----------------
+# ---------------- USER PROFILES & DOWNLOADS CHECK ----------------
 if (-not (Test-Path $UserRoot)) {
     Write-Report "`nUser root not found: $UserRoot"
 } else {
     Write-Report "`n=== User Profile Space Usage ($UserRoot) ===`n"
 
     $skip = @('Default','Default User','Public','All Users')
-
     try {
         $profiles = Get-ChildItem -Path $UserRoot -Directory -ErrorAction SilentlyContinue |
                     Where-Object { $skip -notcontains $_.Name }
     } catch {
-        Write-Report "ERROR: Unable to enumerate profiles: $($_.Exception.Message)"
+        Write-Report "ERROR: Unable to enumerate profiles"
         exit 4
     }
 
-    $thresholdBytes = [int64]($LargeThresholdGB * 1GB)
-
-    # First: compute stats per profile (single pass each), store in memory for later printing
+    $generalThresholdBytes = [int64]($LargeThresholdGB * 1GB)
+    $downloadsThresholdBytes = [int64]($DownloadsThresholdGB * 1GB)
     $profileStats = @()
 
+    # 1. Gather stats
     foreach ($p in $profiles) {
-        $stats = Get-ProfileStatsSinglePass -User $p.Name -ProfilePath $p.FullName -ThresholdBytes $thresholdBytes
-
-        $row = [pscustomobject]@{
+        $stats = Get-ProfileStatsSinglePass -User $p.Name -ProfilePath $p.FullName -ThresholdBytes $generalThresholdBytes
+        
+        $profileStats += $stats
+        $profileResults += [pscustomobject]@{
             User   = $p.Name
             Path   = $p.FullName
             SizeGB = To-GB $stats.TotalBytes
         }
-
-        $profileStats += $stats
-        $profileResults += $row
     }
 
-    if ($profileResults.Count -gt 0) {
-        if (-not $AsJson) {
-            $profileResults | Sort-Object SizeGB -Descending | Format-Table -AutoSize
-        }
-    } else {
-        Write-Report "No user profiles found."
+    # 2. Print summary table
+    if ($profileResults.Count -gt 0 -and -not $AsJson) {
+        $profileResults | Sort-Object SizeGB -Descending | Format-Table -AutoSize
     }
 
-    # Then: per-user large items derived from the same single traversal
+    # 3. Analyze specific items (Downloads & Large Folders)
     foreach ($stats in $profileStats) {
         Write-Report ""
         Write-Report ("--- {0} ({1}) ---" -f $stats.User, $stats.Path)
 
-        $bigFolders = @()
+        # --- SPECIAL CHECK: DOWNLOADS FOLDER ---
+        if ($stats.BytesByTopFolder.ContainsKey('Downloads')) {
+            $dlBytes = [int64]$stats.BytesByTopFolder['Downloads']
+            $dlGB = To-GB $dlBytes
+            
+            if ($dlBytes -ge $downloadsThresholdBytes) {
+                $LargeItemsFound = $true
+                Write-Report ("WARNING: Downloads folder is {0} GB (Limit {1} GB)" -f $dlGB, $DownloadsThresholdGB) -ForegroundColor Yellow
+                
+                $downloadsResults += [pscustomobject]@{
+                    User = $stats.User
+                    SizeGB = $dlGB
+                }
+            } else {
+                Write-Report ("Downloads folder: {0} GB (OK)" -f $dlGB)
+            }
+        } else {
+            Write-Report "Downloads folder: 0 GB (OK)"
+        }
 
+        # --- CHECK OTHER LARGE ITEMS ---
+        $bigFolders = @()
         foreach ($k in $stats.BytesByTopFolder.Keys) {
             $b = [int64]$stats.BytesByTopFolder[$k]
-
-            if ($b -ge $thresholdBytes) {
+            
+            # Use general threshold for everything (including Downloads if it matches)
+            if ($b -ge $generalThresholdBytes) {
+                # We set flag, but we don't need to double-warn if we just warned about Downloads above,
+                # though repeating it in the "Large Items" list below is standard behavior.
                 $LargeItemsFound = $true
 
                 $folderPath = if ($k -eq '(root)') { $stats.Path } else { Join-Path $stats.Path $k }
-                $modified = $null
-                try {
-                    $modified = (Get-Item -LiteralPath $folderPath -Force:$IncludeHidden -ErrorAction SilentlyContinue).LastWriteTime
-                } catch { $modified = $null }
-
-                $item = [pscustomobject]@{
-                    ItemType = if ($k -eq '(root)') { 'Root' } else { 'Folder' }
+                
+                $bigFolders += [pscustomobject]@{
+                    ItemType = 'Folder'
                     User     = $stats.User
-                    Name     = if ($k -eq '(root)') { '(profile root files)' } else { $k }
+                    Name     = $k
                     SizeGB   = To-GB $b
                     Path     = $folderPath
-                    Modified = $modified
                 }
-
-                $bigFolders += $item
-                $largeItemsResults += $item
             }
         }
 
-        $bigFiles = @()
-        if ($IncludeLargeFiles -and $stats.LargeFiles) {
-            $bigFiles = $stats.LargeFiles
-            foreach ($bf in $bigFiles) { $largeItemsResults += $bf }
-        }
-
-        if (($bigFolders.Count + $bigFiles.Count) -gt 0) {
-            Write-Report ("Large items (>= {0} GB) for user {1}:" -f $LargeThresholdGB, $stats.User)
+        # Report general large items
+        if (($bigFolders.Count + $stats.LargeFiles.Count) -gt 0) {
+            Write-Report ("Top folders/files >= {0} GB:" -f $LargeThresholdGB)
             if (-not $AsJson) {
-                ($bigFolders + $bigFiles) | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+                ($bigFolders + $stats.LargeFiles) | Sort-Object SizeGB -Descending | Format-Table -AutoSize
             }
-        } else {
-            Write-Report ("No folders/files >= {0} GB under this profile." -f $LargeThresholdGB)
+            $largeItemsResults += ($bigFolders + $stats.LargeFiles)
         }
     }
 }
@@ -359,16 +333,10 @@ Write-Report "`n=== Check complete ==="
 
 if ($AsJson) {
     [pscustomobject]@{
-        Version              = '1.7'
-        LowSpaceThreshold    = $LowSpaceThreshold
-        LargeThresholdGB     = $LargeThresholdGB
-        UserRoot             = $UserRoot
-        IncludeHidden        = $IncludeHidden
-        IncludeRecycleBin    = $IncludeRecycleBin
-        RecycleBinThresholdGB = $RecycleBinThresholdGB
-        IncludeLargeFiles    = $IncludeLargeFiles
+        Version              = '5.1'
         LowSpaceFound        = $LowSpaceFound
         LargeItemsFound      = $LargeItemsFound
+        DownloadsAlerts      = $downloadsResults
         Drives               = $driveResults
         RecycleBins          = $recycleBinResults
         Profiles             = $profileResults
@@ -382,6 +350,5 @@ try {
     elseif ($LargeItemsFound)                 { exit 2 }
     else                                      { exit 0 }
 } catch {
-    Write-Report "ERROR: Unexpected failure when setting exit code: $($_.Exception.Message)"
     exit 4
 }
