@@ -1,37 +1,57 @@
-<#
-.SYNOPSIS
-  Auto-Pilot Detection for Google Chrome (Hybrid Policy).
-  Queries Google's official API for the latest Stable version.
-#>
-$ErrorActionPreference = "SilentlyContinue"
+param(
+    [string]$TargetVersion = '145.0.7632.75'
+)
 
-# 1. GET LOCAL VERSION (Update Only - If missing, Exit 0)
-$Chrome64 = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-$Chrome32 = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-$LocalPath = if (Test-Path $Chrome64) { $Chrome64 } elseif (Test-Path $Chrome32) { $Chrome32 } else { $null }
-if (-not $LocalPath) { Write-Output "Not Installed - Compliant"; exit 0 }
+function Convert-ToVersion {
+    param([string]$v)
+    try { [version]$v } catch { [version]'0.0.0.0' }
+}
 
-$LocalVer = (Get-Item $LocalPath).VersionInfo.ProductVersion
-# Clean version string (remove build metadata if present)
-$CleanLocal = [version]($LocalVer -split '\s+')[0]
+function Get-ChromeMachineExe {
+    $paths = @()
+    if ($env:ProgramFiles) {
+        $paths += Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+    }
+    $pf86 = ${env:ProgramFiles(x86)}
+    if ($pf86) {
+        $paths += Join-Path $pf86 'Google\Chrome\Application\chrome.exe'
+    }
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
 
-# 2. GET ONLINE VERSION (Google API)
-try {
-    # Official endpoint for latest stable versions
-    $Uri = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json"
-    $Response = Invoke-RestMethod -Uri $Uri -Method Get -ErrorAction Stop
-    $OnlineVer = [version]$Response.channels.Stable.version
-} catch {
-    Write-Warning "API Unreachable. Assuming Compliant to prevent errors."
+function Get-ChromeVersion {
+    param([string]$ExePath)
+    $vi = (Get-Item $ExePath).VersionInfo
+    $v  = $vi.ProductVersion
+    if ([string]::IsNullOrWhiteSpace($v)) { $v = $vi.FileVersion }
+    Convert-ToVersion $v
+}
+
+$target = Convert-ToVersion $TargetVersion
+$chromeExe = Get-ChromeMachineExe
+
+if (-not $chromeExe) {
+    # For "Update Only" Win32 apps, we report compliant if not installed to avoid forced installs
+    Write-Output "Installed=No; Compliant=Yes (UpdateOnly)"
     exit 0
 }
 
-# 3. COMPARE
-if ($CleanLocal -ge $OnlineVer) {
-    Write-Output "Compliant ($CleanLocal >= $OnlineVer)"
-    exit 0
-} else {
-    Write-Output "Update Needed ($CleanLocal < $OnlineVer)"
-    exit 1
-}
+$current = Get-ChromeVersion -ExePath $chromeExe
+$appFolder = Split-Path $chromeExe -Parent
+$targetFolder = Join-Path $appFolder $TargetVersion
+
+# COMPLIANCE LOGIC: 
+# Compliant if the running version is >= target OR if the target version folder is staged on disk
+$isStaged = Test-Path $targetFolder
+$compliant = ($current -ge $target) -or $isStaged
+
+$compText = if ($compliant) { 'Yes' } else { 'No' }
+Write-Output ("Installed=Yes; Version={0}; Staged={1}; Target={2}; Compliant={3}" -f $current, $isStaged, $target, $compText)
+
+if ($compliant) { exit 0 } else { exit 1 }

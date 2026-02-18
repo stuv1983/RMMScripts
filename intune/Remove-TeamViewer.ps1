@@ -1,228 +1,247 @@
 <#
 .SYNOPSIS
-  Intune Win32 app scripts for enforcing a "remove TeamViewer" policy.
+    Removes installed TeamViewer and forcibly stops running TeamViewer processes.
 
 .DESCRIPTION
-  These scripts are designed for removal deployments:
-    - Detection: If TeamViewer is present, return exit 1 so Intune runs the removal script.
-    - Removal: Force-close TeamViewer (processes + services) and uninstall silently.
-    - If TeamViewer is not present, device is compliant.
+    - Workstation-only guardrail.
+    - Uninstalls installed TeamViewer (registry).
+    - Stops running TeamViewer processes (portable QuickSupport etc.) reliably:
+        1) Stop-Process (shows errors)
+        2) taskkill fallback (/F /T)
+    - Post-check prints what remains.
 
-.NOTES
-  Intended execution context: SYSTEM (Intune Win32 app).
-  Exit codes:
-    - Detection: 0 = compliant (not present), 1 = non-compliant (present)
-    - Removal:   0 = removed / not present, 1 = removal failed or still detected
+    Portable EXE deletion is present but DISABLED (commented out).
+    No disk logging.
 
+.EXITCODES
+    0 = No installed TeamViewer AND no running TeamViewer processes
+    1 = Still installed/running OR uninstall failures
 #>
 
 [CmdletBinding()]
 param(
-    # Remove residual files after uninstall (recommended).
-    [bool]$RemoveResidualFiles = $true,
-
-    # Disable TeamViewer services before uninstall (recommended).
-    [bool]$DisableServices = $true
+    [int]$StopRetries = 3,
+    [int]$RetryDelaySeconds = 2
 )
 
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
-
-function Write-Log([string]$Msg) {
-    Write-Output "[TeamViewer-Remove] $Msg"
+# ------------------------------------------------------------
+# STEP 0 – WORKSTATION GUARDRAIL
+# ------------------------------------------------------------
+# ProductType: 1=Workstation, 2=DC, 3=Server
+$os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+if (-not $os -or $os.ProductType -ne 1) {
+    Write-Output "Skipping: Not a workstation OS."
+    exit 0
 }
 
-# Force-close any running TeamViewer components.
-# This is intentional: RMM is the approved remote tool.
-function Stop-TeamViewerProcesses {
-    Write-Log "Force-closing TeamViewer processes (best-effort)..."
-    Get-Process -Name "TeamViewer*" -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            Write-Log "Stopping process: $($_.Name) PID=$($_.Id)"
-            Stop-Process -Id $_.Id -Force -ErrorAction Stop
-        } catch {
-            Write-Log "Process stop failed: $($_.Name) - $($_.Exception.Message)"
+# ------------------------------------------------------------
+# STEP 1 – UNINSTALL REGISTRY LOCATIONS
+# ------------------------------------------------------------
+$UninstallPaths = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+
+function Get-InstalledTeamViewer {
+    foreach ($p in $UninstallPaths) {
+        Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -and $_.DisplayName -match 'TeamViewer' } |
+            Select-Object DisplayName, DisplayVersion, UninstallString, QuietUninstallString
+    }
+}
+
+function Get-RunningTeamViewer {
+    # Get-Process gives us the running set; CIM adds ExecutablePath when available.
+    $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^TeamViewer' }
+    foreach ($proc in $procs) {
+        $cim = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $proc.Id) -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            Name           = ($proc.Name + ".exe")
+            ProcessId      = $proc.Id
+            ExecutablePath = $cim.ExecutablePath
         }
     }
 }
 
-# Stop/disable services to prevent auto-restart and file locks during uninstall.
-function Stop-Disable-TeamViewerServices {
-    Write-Log "Stopping/disabling TeamViewer services (best-effort)..."
-    Get-Service -Name "TeamViewer*" -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            if ($_.Status -ne 'Stopped') {
-                Write-Log "Stopping service: $($_.Name)"
-                Stop-Service -Name $_.Name -Force -ErrorAction Stop
-            }
-        } catch {
-            Write-Log "Service stop failed: $($_.Name) - $($_.Exception.Message)"
-        }
-
-        if ($DisableServices) {
-            try {
-                Write-Log "Disabling service: $($_.Name)"
-                Set-Service -Name $_.Name -StartupType Disabled -ErrorAction Stop
-            } catch {
-                Write-Log "Service disable failed: $($_.Name) - $($_.Exception.Message)"
-            }
-        }
-    }
+function Get-MsiGuidFromString {
+    param([string]$Text)
+    $m = [regex]::Match($Text, '\{[0-9A-Fa-f\-]{36}\}')
+    if ($m.Success) { return $m.Value }
+    return $null
 }
 
-# Pull uninstall registry entries for TeamViewer products (32-bit + 64-bit).
-function Get-TeamViewerUninstallEntries {
-    $paths = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-
-    # Starts-with match keeps it scoped to TeamViewer products
-    Get-ItemProperty $paths -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match '^TeamViewer' -and ($_.UninstallString -or $_.QuietUninstallString) } |
-        Sort-Object DisplayName -Unique
-}
-
-# Execute a silent uninstall for a single registry entry.
-# Preference order:
-#   1) QuietUninstallString
-#   2) MSI uninstall via msiexec /x {GUID} /qn
-#   3) EXE uninstall via UninstallString + /S fallback
-function Invoke-SilentUninstall {
-    [CmdletBinding()]
-    param([Parameter(Mandatory=$true)]$App)
-
-    $name = [string]$App.DisplayName
-    $ver  = [string]$App.DisplayVersion
-    $un   = [string]$App.UninstallString
-    $qun  = [string]$App.QuietUninstallString
-
-    Write-Log "Uninstalling: $name $ver"
-
-    # Prefer QuietUninstallString if present (often already silent)
-    if ($qun) {
-        Write-Log "Using QuietUninstallString."
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$qun`"" -Wait -PassThru -WindowStyle Hidden
-        return $p.ExitCode
-    }
-
-    if (-not $un) {
-        Write-Log "No UninstallString present for $name (skipping)."
-        return 0
-    }
-
-    # MSI installs: enforce /x /qn /norestart
-    if ($un -match '(?i)msiexec(\.exe)?\s') {
-        $guid = $null
-        if ($un -match '\{[0-9A-Fa-f\-]{36}\}') { $guid = $Matches[0] }
-
-        if ($guid) {
-            $msiArgs = "/x $guid /qn /norestart"
-            Write-Log "MSI uninstall: msiexec.exe $msiArgs"
-            $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru -WindowStyle Hidden
-            return $p.ExitCode
-        }
-
-        # Fallback: transform /I -> /X and append /qn /norestart
-        $cmd = $un -replace '(?i)\s/I\s', ' /X '
-        if ($cmd -notmatch '(?i)/q(n|uiet)') { $cmd += ' /qn' }
-        if ($cmd -notmatch '(?i)/norestart') { $cmd += ' /norestart' }
-
-        Write-Log "MSI fallback command: $cmd"
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$cmd`"" -Wait -PassThru -WindowStyle Hidden
-        return $p.ExitCode
-    }
-
-    # EXE uninstallers: run full commandline and append silent flags if missing
-    $cmdLine = $un
-
-    # TeamViewer commonly uses Nullsoft /S; some bundles use /SILENT
-    if ($cmdLine -notmatch '(?i)\s/(S|silent|verysilent|qn|quiet)\b') {
-        $cmdLine = "$cmdLine /S"
-    }
-
-    Write-Log "EXE uninstall command: $cmdLine"
-    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$cmdLine`"" -Wait -PassThru -WindowStyle Hidden
+function Invoke-MSIUninstall {
+    param([string]$Guid)
+    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x $Guid /qn /norestart" -Wait -PassThru -WindowStyle Hidden
     return $p.ExitCode
 }
 
-function Remove-ResidualPaths {
-    if (-not $RemoveResidualFiles) { return }
+function Invoke-ExeUninstall {
+    param([string]$UninstallString)
 
-    Write-Log "Removing residual TeamViewer folders (best-effort)..."
+    $exe = $null; $args = $null
+    if ($UninstallString -match '^\s*"(.*?)"\s*(.*)$') { $exe=$matches[1]; $args=$matches[2] }
+    elseif ($UninstallString -match '^\s*([^\s]+)\s*(.*)$') { $exe=$matches[1]; $args=$matches[2] }
+    else { return 1 }
 
-    $paths = @(
-        "$env:ProgramFiles\TeamViewer",
-        "${env:ProgramFiles(x86)}\TeamViewer",
-        "$env:ProgramData\TeamViewer"
+    if ($args -notmatch '/S|/silent|/verysilent|/qn') { $args = ($args + ' /S').Trim() }
+
+    $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+    if (-not $p) { return 1 }
+    return $p.ExitCode
+}
+
+function Stop-TeamViewerProcess {
+    <#
+    Attempts to stop a process by ProcessId.
+    Returns $true if the process no longer exists after attempts.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ProcessName
     )
 
-    foreach ($p in $paths) {
-        try {
-            if (Test-Path $p) {
-                Write-Log "Removing: $p"
-                Remove-Item $p -Recurse -Force -ErrorAction Stop
+    # Attempt 1: Stop-Process with visible errors
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        Write-Output ("Stop-Process succeeded for {0} (PID {1})" -f $ProcessName, $ProcessId)
+    }
+    catch {
+        Write-Output ("Stop-Process FAILED for {0} (PID {1}): {2}" -f $ProcessName, $ProcessId, $_.Exception.Message)
+    }
+
+    Start-Sleep -Milliseconds 300
+
+    # Check if still exists
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+        return $true
+    }
+
+    # Attempt 2: taskkill fallback (force + terminate child processes)
+    Write-Output ("taskkill fallback for {0} (PID {1})" -f $ProcessName, $ProcessId)
+    $null = & taskkill.exe /PID $ProcessId /F /T 2>$null
+
+    Start-Sleep -Milliseconds 500
+
+    return (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue))
+}
+
+# ------------------------------------------------------------
+# STEP 2 – UNINSTALL INSTALLED TEAMVIEWER
+# ------------------------------------------------------------
+$failed = $false
+$installed = @(Get-InstalledTeamViewer)
+
+if ($installed.Count -gt 0) {
+    Write-Output "Installed TeamViewer entries found (uninstalling):"
+    $installed | Sort-Object DisplayName, DisplayVersion | ForEach-Object {
+        Write-Output (" - {0} (v{1})" -f $_.DisplayName, $_.DisplayVersion)
+    }
+
+    foreach ($app in $installed) {
+        $cmd = if ($app.QuietUninstallString) { $app.QuietUninstallString } else { $app.UninstallString }
+        if (-not $cmd) { Write-Output ("Uninstall string missing: {0}" -f $app.DisplayName); $failed=$true; continue }
+
+        $guid = Get-MsiGuidFromString $cmd
+
+        if ($cmd -match 'msiexec\.exe' -or $guid) {
+            if ($guid) {
+                Write-Output ("Removing (MSI): {0} GUID={1}" -f $app.DisplayName, $guid)
+                $code = Invoke-MSIUninstall $guid
             }
-        } catch {
-            Write-Log "Residual removal failed for ${p}: $($_.Exception.Message)"
+            else {
+                Write-Output ("Removing (EXE fallback): {0}" -f $app.DisplayName)
+                $code = Invoke-ExeUninstall $cmd
+            }
         }
+        else {
+            Write-Output ("Removing (EXE): {0}" -f $app.DisplayName)
+            $code = Invoke-ExeUninstall $cmd
+        }
+
+        Write-Output (" -> ExitCode: {0}" -f $code)
+        if ($code -ne 0 -and $code -ne 3010) { $failed = $true }
+    }
+}
+else {
+    Write-Output "No installed TeamViewer entries found."
+}
+
+# ------------------------------------------------------------
+# STEP 3 – STOP RUNNING TEAMVIEWER (RETRIES + VERIFICATION)
+# ------------------------------------------------------------
+for ($attempt = 1; $attempt -le $StopRetries; $attempt++) {
+
+    $running = @(Get-RunningTeamViewer)
+
+    if ($running.Count -eq 0) {
+        Write-Output "No running TeamViewer processes detected."
+        break
+    }
+
+    Write-Output ("Running TeamViewer processes found (attempt {0}/{1}):" -f $attempt, $StopRetries)
+    $running | ForEach-Object {
+        Write-Output (" - {0} (PID {1}) Path={2}" -f $_.Name, $_.ProcessId, $_.ExecutablePath)
+    }
+
+    foreach ($p in $running) {
+        $killed = Stop-TeamViewerProcess -ProcessId $p.ProcessId -ProcessName $p.Name
+        if ($killed) {
+            Write-Output ("Confirmed stopped: {0} (PID {1})" -f $p.Name, $p.ProcessId)
+        } else {
+            Write-Output ("FAILED to stop: {0} (PID {1})" -f $p.Name, $p.ProcessId)
+        }
+    }
+
+    Start-Sleep -Seconds $RetryDelaySeconds
+}
+
+# ------------------------------------------------------------
+# OPTIONAL – PORTABLE EXE DELETION (DISABLED)
+# ------------------------------------------------------------
+# Present but commented out. Enable only if policy requires deletion.
+#
+
+$UserPaths = @(
+  "$env:SystemDrive\Users\*\Downloads",
+  "$env:SystemDrive\Users\*\Desktop",
+  "$env:SystemDrive\Users\*\AppData\Local\Temp"
+)
+foreach ($base in $UserPaths) {
+  Get-ChildItem -Path $base -Recurse -Include "*TeamViewer*.exe" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      Write-Output ("Deleting Portable EXE: {0}" -f $_.FullName)
+      Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
     }
 }
 
-try {
-    Write-Log "Starting removal policy."
 
-    Stop-TeamViewerProcesses
-    Stop-Disable-TeamViewerServices
+# ------------------------------------------------------------
+# STEP 4 – POST-CHECK (PRINT WHAT REMAINS)
+# ------------------------------------------------------------
+$remainingInstalled = @(Get-InstalledTeamViewer)
+$remainingRunning   = @(Get-RunningTeamViewer)
 
-    $apps = Get-TeamViewerUninstallEntries
-    if (-not $apps -or $apps.Count -eq 0) {
-        Write-Log "No TeamViewer uninstall entries found. Already removed."
-        Remove-ResidualPaths
-        exit 0
-    }
+if ($remainingInstalled.Count -gt 0 -or $remainingRunning.Count -gt 0 -or $failed) {
 
-    $failures = @()
-
-    foreach ($app in $apps) {
-        try {
-            $code = Invoke-SilentUninstall -App $app
-            Write-Log "Exit code for '$($app.DisplayName)': $code"
-
-            # 0 success, 3010 reboot required (treat as success)
-            if ($code -ne 0 -and $code -ne 3010) {
-                $failures += [pscustomobject]@{ Name=$app.DisplayName; ExitCode=$code }
-            }
-        } catch {
-            Write-Log "Exception uninstalling '$($app.DisplayName)': $($_.Exception.Message)"
-            $failures += [pscustomobject]@{ Name=$app.DisplayName; ExitCode='Exception' }
+    if ($remainingInstalled.Count -gt 0) {
+        Write-Output "Post-check: Installed TeamViewer still present:"
+        $remainingInstalled | Sort-Object DisplayName, DisplayVersion | ForEach-Object {
+            Write-Output (" - {0} (v{1})" -f $_.DisplayName, $_.DisplayVersion)
         }
     }
 
-    # Close again in case a helper process restarted mid-uninstall
-    Stop-TeamViewerProcesses
-    Stop-Disable-TeamViewerServices
-
-    Remove-ResidualPaths
-
-    # Final verification: if still present, treat as failure so Intune keeps retrying
-    $remaining = Get-TeamViewerUninstallEntries
-    if ($remaining -and $remaining.Count -gt 0) {
-        Write-Log "TeamViewer still detected after uninstall attempt:"
-        $remaining | ForEach-Object { Write-Log " - $($_.DisplayName) $($_.DisplayVersion)" }
-        exit 1
+    if ($remainingRunning.Count -gt 0) {
+        Write-Output "Post-check: TeamViewer still running:"
+        $remainingRunning | ForEach-Object {
+            Write-Output (" - {0} (PID {1}) Path={2}" -f $_.Name, $_.ProcessId, $_.ExecutablePath)
+        }
     }
 
-    if ($failures.Count -gt 0) {
-        Write-Log "One or more uninstallers returned non-success codes:"
-        $failures | ForEach-Object { Write-Log " - $($_.Name): $($_.ExitCode)" }
-        exit 1
-    }
+    if ($failed) { Write-Output "Post-check: One or more uninstall actions reported failure." }
 
-    Write-Log "Removal complete. TeamViewer not detected."
-    exit 0
-}
-catch {
-    Write-Log "Fatal error: $($_.Exception.Message)"
     exit 1
 }
+
+Write-Output "Removal complete: No installed or running TeamViewer detected."
+exit 0

@@ -1,202 +1,69 @@
 <#
 .SYNOPSIS
-  Install-Chrome.ps1 (Auto-Pilot, Fail-Closed with Cached Fallback)
-
-.DESCRIPTION
-  Update-only installer for Google Chrome that pairs with Detect-Chrome.ps1.
-
-  CURRENT MODE:
-    ✔ Stable channel — ACTIVE
-    ✖ Extended Stable — COMMENTED OUT
-
-  Install flow:
-    1) If Chrome is running -> exit 0 (avoid disrupting user; Intune retries later).
-    2) If Chrome is NOT installed -> exit 0 (update-only policy).
-    3) Determine required version (vendor -> cache -> fail-closed).
-    4) If installed version < required -> download latest installer and update silently.
-
-  Vendor API:
-    https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/<channel>/versions
-    Channel identifiers include 'stable' and 'extended'. citeturn0search1
-
-  Registry cache:
-    HKLM:\Software\Kenstra\Evergreen\Chrome
-      LatestVendorVersion (REG_SZ)
-      LastVendorCheckUtc  (REG_SZ)
-
+    Installs/Updates Google Chrome using Winget.
+    Logic: Tries 'Upgrade' first. If Winget doesn't see Chrome, it runs 'Install' to force it.
 #>
+$ErrorActionPreference = 'Stop'
 
-[CmdletBinding()]
-param()
+function Get-WingetPath {
+    # Check standard alias
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) { return $winget.Source }
 
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-
-$Chrome64  = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-$Chrome32  = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-$Installer = "$env:TEMP\ChromeSetup.exe"
-
-$RegPath = "HKLM:\Software\Kenstra\Evergreen\Chrome"
-
-function Get-SafeVersionFromString {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-
-    # Extract numeric dotted version portion only
-    $m = [regex]::Match($Value, '(\d+(\.\d+){1,3})')
-    if (-not $m.Success) { return $null }
-
-    try { return [version]$m.Groups[1].Value } catch { return $null }
-}
-
-function Get-SafeVersionFromExe {
-    param([string]$Path)
-
-    # Missing file => not installed
-    if (-not (Test-Path $Path)) { return $null }
-
-    try {
-        $raw = (Get-Item $Path).VersionInfo.ProductVersion
-        return Get-SafeVersionFromString $raw
-    }
-    catch { return $null }
-}
-
-function Invoke-JsonGet {
-    param(
-        [Parameter(Mandatory=$true)][string]$Uri,
-        [int]$TimeoutSec = 15
-    )
-
-    # Force TLS 1.2 for older systems / .NET defaults
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
-
-    # VersionHistory API is unauthenticated for these endpoints
-    return Invoke-RestMethod -Uri $Uri -Method Get -TimeoutSec $TimeoutSec -ErrorAction Stop
-}
-
-function Get-CachedVendorVersion {
-    param([Parameter(Mandatory=$true)][string]$RegPath)
-
-    try {
-        $v = (Get-ItemProperty -Path $RegPath -Name "LatestVendorVersion" -ErrorAction SilentlyContinue)."LatestVendorVersion"
-        return Get-SafeVersionFromString $v
-    } catch { return $null }
-}
-
-function Set-CachedVendorVersion {
-    param(
-        [Parameter(Mandatory=$true)][string]$RegPath,
-        [Parameter(Mandatory=$true)][string]$VersionString
-    )
-
-    # Create path if missing
-    New-Item -Path $RegPath -Force | Out-Null
-
-    # Store latest vendor version observed
-    New-ItemProperty -Path $RegPath -Name "LatestVendorVersion" -Value $VersionString -PropertyType String -Force | Out-Null
-
-    # Store when we last successfully checked the vendor (UTC)
-    New-ItemProperty -Path $RegPath -Name "LastVendorCheckUtc" -Value ((Get-Date).ToUniversalTime().ToString("o")) -PropertyType String -Force | Out-Null
-}
-
-function Download-File {
-    param(
-        [Parameter(Mandatory=$true)][string]$Url,
-        [Parameter(Mandatory=$true)][string]$OutFile
-    )
-
-    # Prefer BITS (more reliable through some proxies)
-    try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
-            Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
-            return
+    # Fallback for SYSTEM context
+    $vlibs = Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -ErrorAction SilentlyContinue
+    if ($vlibs) {
+        foreach ($folder in $vlibs) {
+            $exe = Join-Path $folder.FullName "winget.exe"
+            if (Test-Path $exe) { return $exe }
         }
-    } catch { }
-
-    # Fallback to Invoke-WebRequest
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
-}
-
-function Assert-DownloadOk {
-    param(
-        [Parameter(Mandatory=$true)][string]$FilePath,
-        [int64]$MinBytes = 1048576
-    )
-
-    if (-not (Test-Path $FilePath)) { throw "Installer download missing: $FilePath" }
-    if ((Get-Item $FilePath).Length -lt $MinBytes) { throw "Installer too small; download likely failed." }
-}
-
-function Get-LatestChromeChannelVersion {
-    param([Parameter(Mandatory=$true)][string]$Channel)
-
-    $uri = "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/$Channel/versions"
-    $data = Invoke-JsonGet -Uri $uri
-    if (-not $data.versions) { return $null }
-
-    $versions = @()
-    foreach ($v in $data.versions) {
-        $pv = Get-SafeVersionFromString $v.version
-        if ($pv) { $versions += $pv }
     }
-    if ($versions.Count -eq 0) { return $null }
-
-    return ($versions | Sort-Object -Descending | Select-Object -First 1)
-}
-
-function Get-LatestChromeVersion {
-    # ===== OPTION A — STABLE (ACTIVE) =====
-    $channel = "stable"
-
-    # ===== OPTION B — EXTENDED STABLE (Commented Out) =====
-    # $channel = "extended"
-
-    return Get-LatestChromeChannelVersion -Channel $channel
+    return $null
 }
 
 try {
-    # Avoid disrupting users
-    if (Get-Process "chrome" -ErrorAction SilentlyContinue) { exit 0 }
+    Write-Output "STARTING: Locating Winget..."
+    $wingetPath = Get-WingetPath
+    
+    if (-not $wingetPath) {
+        Write-Output "FAILED: Winget not found."
+        exit 1
+    }
+    
+    Write-Output "FOUND: $wingetPath"
+    
+    # Common arguments for both attempts
+    # We use '--source winget' to avoid Store certificate issues
+    $argsBase = "--id Google.Chrome --source winget --exact --silent --accept-source-agreements --accept-package-agreements --disable-interactivity --force"
 
-    $installed = Get-SafeVersionFromExe $Chrome64
-    if (-not $installed) { $installed = Get-SafeVersionFromExe $Chrome32 }
-    if (-not $installed) { exit 0 }
+    # --- ATTEMPT 1: UPGRADE ---
+    Write-Output "ATTEMPT 1: Winget UPGRADE..."
+    $proc = Start-Process -FilePath $wingetPath -ArgumentList "upgrade $argsBase" -PassThru -Wait -NoNewWindow
 
-    $latest = $null
-
-    try {
-        $latest = Get-LatestChromeVersion
-        if ($latest) {
-            Set-CachedVendorVersion -RegPath $RegPath -VersionString $latest.ToString()
-        }
-    } catch {
-        $latest = $null
+    # Exit Code -1978335212 (0x8A150014) means "No installed package found"
+    if ($proc.ExitCode -eq -1978335212) {
+        Write-Output "WARNING: Winget cannot find an existing managed package to upgrade."
+        Write-Output "ATTEMPT 2: Winget INSTALL (Force Overwrite)..."
+        
+        # --- ATTEMPT 2: INSTALL ---
+        $proc = Start-Process -FilePath $wingetPath -ArgumentList "install $argsBase" -PassThru -Wait -NoNewWindow
     }
 
-    if (-not $latest) {
-        $latest = Get-CachedVendorVersion -RegPath $RegPath
+    # --- FINAL CHECK ---
+    if ($proc.ExitCode -eq 0) {
+        Write-Output "SUCCESS: Winget operation completed."
+        exit 0
     }
-
-    # Fail-closed: if we can't determine "latest", fail so Intune retries.
-    if (-not $latest) { exit 1 }
-
-    if ($installed -ge $latest) { exit 0 }
-
-    # Download and run Google's latest installer silently
-    $url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
-    Download-File -Url $url -OutFile $Installer
-    Assert-DownloadOk -FilePath $Installer
-
-    $p = Start-Process -FilePath $Installer -ArgumentList "/silent /install" -Wait -PassThru -WindowStyle Hidden
-    $code = $p.ExitCode
-    if ($code -ne 0 -and $code -ne 3010) { throw "Chrome installer exit code: $code" }
-
-    Remove-Item $Installer -Force -ErrorAction SilentlyContinue
-    exit 0
+    elseif ($proc.ExitCode -eq 2316632065) { # "No update available"
+        Write-Output "SUCCESS: No update needed (Already on latest)."
+        exit 0
+    }
+    else {
+        Write-Output "FAILED: Winget exited with code $($proc.ExitCode)"
+        exit 1
+    }
 }
 catch {
+    Write-Output "ERROR: $($_.Exception.Message)"
     exit 1
 }
