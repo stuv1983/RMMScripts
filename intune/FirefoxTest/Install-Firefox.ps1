@@ -3,7 +3,7 @@
   Backs up Firefox user data, updates System 64-bit and 32-bit installations 
   using packaged MSIs, and safely removes dormant AppData installations.
 #>
-$TargetVersion = "147.0.3" 
+$TargetVersion = "147.0.4" 
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue" 
