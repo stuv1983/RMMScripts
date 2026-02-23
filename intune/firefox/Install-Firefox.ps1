@@ -1,163 +1,168 @@
 <#
 .SYNOPSIS
-    Install-Firefox.ps1
-    Auto-Pilot update-only installer with:
-      - Fail-Closed logic
-      - Cached fallback
-      - ESR tracking (Release available but commented)
-
+  Remediate-Firefox-EnterpriseMigration.ps1
+  Installation/Remediation script for Intune Win32 App.
 .DESCRIPTION
-    Install flow:
-
-    1) If Firefox running → exit 0 (no disruption).
-    2) If not installed → exit 0 (update-only policy).
-    3) Determine required version:
-         - Vendor API
-         - Cached version fallback
-    4) If both unavailable → Fail-Closed (exit 1).
-    5) If installed version < required → download and update silently.
+  Actions performed:
+  1. Deletes rogue per-user Firefox binaries from all AppData folders (deferring if locked).
+  2. Installs or upgrades the Enterprise MSI system-wide.
+  3. Deletes duplicate personal desktop shortcuts.
+  4. Rewires Taskbar and Start Menu shortcuts to point to the new Enterprise path.
 #>
 
-[CmdletBinding()]
-param()
-
 $ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
 
-$Firefox64 = "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
-$Firefox32 = "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
-$Installer = "$env:TEMP\FirefoxSetup.exe"
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+$TargetVersion = [version]"147.0.4"
+$MsiName64 = "Firefox Setup 147.0.4-64bit.msi"
+$MsiName32 = "Firefox Setup 147.0.4-32bit.msi"
 
-$RegPath = "HKLM:\Software\Kenstra\Evergreen\Firefox"
-
-# ---------- Shared Helpers ----------
-
-function Get-SafeVersionFromString {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $m = [regex]::Match($Value, '(\d+(\.\d+){1,3})')
-    if (-not $m.Success) { return $null }
-    return [version]$m.Groups[1].Value
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+function Get-UserProfileDirs {
+    # Safely returns all human user profile directories, ignoring default/system accounts
+    $skip = @("All Users","Default","Default User","Public","WDAGUtilityAccount")
+    Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $skip -notcontains $_.Name }
 }
 
-function Get-SafeVersionFromExe {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return $null }
-    try {
-        return Get-SafeVersionFromString ((Get-Item $Path).VersionInfo.ProductVersion)
-    } catch { return $null }
+function Update-FirefoxShortcuts {
+    Write-Output "Scanning for per-user Firefox shortcuts to redirect or remove..."
+    $shell = New-Object -ComObject WScript.Shell
+    
+    # Determine the correct new Program Files path based on OS architecture
+    $newTarget = if ([Environment]::Is64BitOperatingSystem) {
+        Join-Path -Path $env:ProgramFiles -ChildPath "Mozilla Firefox\firefox.exe"
+    } else {
+        Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox\firefox.exe"
+    }
+    $newWorkingDir = Split-Path -Path $newTarget -Parent
+
+    # Search paths for potential rogue shortcuts (Desktop, Start Menu, Taskbar)
+    $searchPaths = @(
+        "C:\Users\*\Desktop\*.lnk",
+        "C:\Users\Public\Desktop\*.lnk",
+        "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk",
+        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\*.lnk",
+        "C:\Users\*\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\*.lnk"
+    )
+
+    $links = Get-ChildItem -Path $searchPaths -ErrorAction SilentlyContinue
+    
+    foreach ($link in $links) {
+        try {
+            $shortcut = $shell.CreateShortcut($link.FullName)
+            $target = $shortcut.TargetPath
+            
+            # Match any shortcut pointing to the old AppData install OR the new MSI install (to fix blank icons)
+            if ($target -match "(?i)AppData\\Local\\Mozilla.*firefox\.exe" -or $target -match "(?i)Mozilla Firefox\\firefox\.exe") {
+                
+                # Prevent the "Two Shortcut" bug: Delete personal desktop shortcuts since the MSI makes a Public one
+                if ($link.FullName -match "(?i)C:\\Users\\[^\\]+\\Desktop\\" -and $link.FullName -notmatch "(?i)C:\\Users\\Public\\") {
+                    Write-Output "Removing duplicate per-user desktop shortcut: $($link.FullName)"
+                    Remove-Item -LiteralPath $link.FullName -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                # For Taskbar, Start Menu, and the Public Desktop shortcut: Rewire and fix the icon
+                Write-Output "Redirecting/Fixing shortcut: $($link.FullName)"
+                $shortcut.TargetPath = $newTarget
+                $shortcut.WorkingDirectory = $newWorkingDir
+                $shortcut.IconLocation = "$newTarget,0"
+                $shortcut.Save()
+            }
+        } catch {}
+    }
 }
 
-function Invoke-JsonGet {
-    param([string]$Uri)
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-    Invoke-RestMethod -Uri $Uri -TimeoutSec 15 -ErrorAction Stop
-}
-
-function Get-CachedVendorVersion {
-    try {
-        return Get-SafeVersionFromString (
-            (Get-ItemProperty -Path $RegPath -Name "LatestVendorVersion" -ErrorAction SilentlyContinue)."LatestVendorVersion"
+function Remove-PerUserFirefoxBinaries {
+    # Scans AppData and silently removes consumer binaries. Leaves Roaming profile data intact.
+    $removedAny = $false
+    foreach ($p in (Get-UserProfileDirs)) {
+        $targets = @(
+            (Join-Path -Path $p.FullName -ChildPath "AppData\Local\Mozilla\Firefox"),
+            (Join-Path -Path $p.FullName -ChildPath "AppData\Local\Firefox")
         )
-    } catch { return $null }
-}
 
-function Set-CachedVendorVersion {
-    param([string]$VersionString)
-    New-Item -Path $RegPath -Force | Out-Null
-    New-ItemProperty -Path $RegPath -Name "LatestVendorVersion" -Value $VersionString -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $RegPath -Name "LastVendorCheckUtc" -Value ((Get-Date).ToUniversalTime().ToString("o")) -PropertyType String -Force | Out-Null
-}
-
-function Get-LatestFirefoxVersion {
-    $uri = "https://product-details.mozilla.org/1.0/firefox_versions.json"
-    $data = Invoke-JsonGet -Uri $uri
-
-    # ===== OPTION A — RELEASE (Commented Out) =====
-    # return Get-SafeVersionFromString $data.LATEST_FIREFOX_VERSION
-
-    # ===== OPTION B — ESR (ACTIVE) =====
-    return Get-SafeVersionFromString $data.FIREFOX_ESR
-}
-
-function Download-File {
-    param([string]$Url, [string]$OutFile)
-
-    try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
-            Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
-            return
+        foreach ($t in $targets) {
+            if (Test-Path -LiteralPath $t) {
+                Write-Output "Attempting to remove per-user Firefox binaries: $t"
+                try {
+                    Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction Stop
+                    $removedAny = $true
+                }
+                catch {
+                    # Silent Deferral: If the user has Firefox open, we don't force close. 
+                    # We catch the locked-file error and defer deletion to the next Intune cycle.
+                    Write-Output "WARN: Files in $t are locked by a running process. Deferring cleanup."
+                    $removedAny = $true
+                }
+            }
         }
-    } catch {}
-
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    }
+    return $removedAny
 }
 
-# ===============================
-# MAIN INSTALL LOGIC
-# ===============================
+function Get-FirefoxMsiFileVersion {
+    # Reads the physical version of the executable in Program Files
+    $paths = @(
+        "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+        "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
+    foreach ($p in $paths) {
+        try {
+            $v = (Get-Item -LiteralPath $p).VersionInfo.ProductVersion
+            if ($v) { return [version]$v }
+        } catch {}
+    }
+    return $null
+}
+
+function Get-MsiPath {
+    # Dynamically locates the MSI file next to where the script is running
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $name = if ([Environment]::Is64BitOperatingSystem) { $MsiName64 } else { $MsiName32 }
+    return (Join-Path -Path $scriptDir -ChildPath $name)
+}
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
 try {
+    Write-Output "Starting Firefox enterprise migration remediation..."
 
-    # Do not interrupt active users
-    if (Get-Process "firefox" -ErrorAction SilentlyContinue) { exit 0 }
+    # 1) Clear out rogue consumer binaries from user profiles
+    $perUserRemoved = Remove-PerUserFirefoxBinaries
 
-    # Determine installed version
-    $installed = Get-SafeVersionFromExe $Firefox64
-    if (-not $installed) { $installed = Get-SafeVersionFromExe $Firefox32 }
+    # 2) Check if the System Version is missing or out of date
+    $installedVersion = Get-FirefoxMsiFileVersion
+    $needsInstall = (-not $installedVersion -or $installedVersion -lt $TargetVersion)
 
-    # Update-only: if not installed, do nothing
-    if (-not $installed) { exit 0 }
+    # 3) Install or Upgrade the Enterprise MSI
+    if ($needsInstall) {
+        $msiPath = Get-MsiPath
+        if (-not (Test-Path -LiteralPath $msiPath)) { throw "MSI not found: $msiPath" }
 
-    $latest = $null
-
-    # Try vendor
-    try {
-        $latest = Get-LatestFirefoxVersion
-        if ($latest) {
-            Set-CachedVendorVersion -VersionString $latest.ToString()
-        }
-    } catch {
-        $latest = $null
+        Write-Output "Installing Enterprise MSI: $msiPath"
+        # /i = install, ALLUSERS=1 = System-wide, /qn = silent, /norestart = suppress reboots
+        $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" ALLUSERS=1 /qn /norestart" -Wait -PassThru
+        Write-Output "MSI exit code: $($proc.ExitCode)"
+    } else {
+        Write-Output "Enterprise MSI already meets target ($installedVersion >= $TargetVersion)."
     }
 
-    # Fallback to cache
-    if (-not $latest) {
-        $latest = Get-CachedVendorVersion
-    }
+    # 4) Clean up duplicates and redirect user pins AFTER the MSI exists
+    Update-FirefoxShortcuts
 
-    # Fail-Closed if nothing available
-    if (-not $latest) { exit 1 }
-
-    # Already compliant
-    if ($installed -ge $latest) { exit 0 }
-
-    # Choose ESR installer architecture
-    $url = "https://download.mozilla.org/?product=firefox-esr-latest&os=win64&lang=en-US"
-    if (Test-Path $Firefox32 -and -not (Test-Path $Firefox64)) {
-        $url = "https://download.mozilla.org/?product=firefox-esr-latest&os=win&lang=en-US"
-    }
-
-    Download-File -Url $url -OutFile $Installer
-
-    # Validate download size (>1MB sanity check)
-    if ((Get-Item $Installer).Length -lt 1048576) {
-        throw "Installer download invalid."
-    }
-
-    # Silent install
-    $p = Start-Process -FilePath $Installer -ArgumentList "/S /MaintenanceService=true" `
-        -Wait -PassThru -WindowStyle Hidden
-
-    # Accept 0 (success) and 3010 (reboot required)
-    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-        throw "Installer failed."
-    }
-
-    Remove-Item $Installer -Force -ErrorAction SilentlyContinue
-    exit 0
+    # Exit cleanly to Intune
+    exit 0 
 }
 catch {
-    # Fail-Closed on unexpected errors
+    Write-Output "ERROR: $($_.Exception.Message)"
+    # Exit 1 tells Intune the installation failed
     exit 1
 }
