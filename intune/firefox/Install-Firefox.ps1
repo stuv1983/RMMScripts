@@ -4,10 +4,11 @@
   Installation/Remediation script for Intune Win32 App.
 .DESCRIPTION
   Actions performed:
-  1. Deletes rogue per-user Firefox binaries from all AppData folders (deferring if locked).
-  2. Installs or upgrades the Enterprise MSI system-wide.
-  3. Deletes duplicate personal desktop shortcuts.
-  4. Rewires Taskbar and Start Menu shortcuts to point to the new Enterprise path.
+  1. Deletes rogue per-user Firefox binaries from AppData.
+  2. Scrubs legacy 32-bit System installations if running on a 64-bit OS.
+  3. Installs or upgrades the Enterprise MSI system-wide.
+  4. Deletes duplicate personal desktop shortcuts.
+  5. Rewires Taskbar and Start Menu shortcuts to point to the new Enterprise path.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -16,14 +17,12 @@ $ErrorActionPreference = "Stop"
 # CONFIGURATION
 # ==============================================================================
 $TargetVersion = [version]"147.0.4"
-$MsiName64 = "Firefox Setup 147.0.4-64bit.msi"
-$MsiName32 = "Firefox Setup 147.0.4-32bit.msi"
+$MsiName = "Firefox Setup 147.0.4.msi"  
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 function Get-UserProfileDirs {
-    # Safely returns all human user profile directories, ignoring default/system accounts
     $skip = @("All Users","Default","Default User","Public","WDAGUtilityAccount")
     Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $skip -notcontains $_.Name }
@@ -33,7 +32,6 @@ function Update-FirefoxShortcuts {
     Write-Output "Scanning for per-user Firefox shortcuts to redirect or remove..."
     $shell = New-Object -ComObject WScript.Shell
     
-    # Determine the correct new Program Files path based on OS architecture
     $newTarget = if ([Environment]::Is64BitOperatingSystem) {
         Join-Path -Path $env:ProgramFiles -ChildPath "Mozilla Firefox\firefox.exe"
     } else {
@@ -41,7 +39,6 @@ function Update-FirefoxShortcuts {
     }
     $newWorkingDir = Split-Path -Path $newTarget -Parent
 
-    # Search paths for potential rogue shortcuts (Desktop, Start Menu, Taskbar)
     $searchPaths = @(
         "C:\Users\*\Desktop\*.lnk",
         "C:\Users\Public\Desktop\*.lnk",
@@ -57,7 +54,6 @@ function Update-FirefoxShortcuts {
             $shortcut = $shell.CreateShortcut($link.FullName)
             $target = $shortcut.TargetPath
             
-            # Match any shortcut pointing to the old AppData install OR the new MSI install (to fix blank icons)
             if ($target -match "(?i)AppData\\Local\\Mozilla.*firefox\.exe" -or $target -match "(?i)Mozilla Firefox\\firefox\.exe") {
                 
                 # Prevent the "Two Shortcut" bug: Delete personal desktop shortcuts since the MSI makes a Public one
@@ -67,7 +63,6 @@ function Update-FirefoxShortcuts {
                     continue
                 }
 
-                # For Taskbar, Start Menu, and the Public Desktop shortcut: Rewire and fix the icon
                 Write-Output "Redirecting/Fixing shortcut: $($link.FullName)"
                 $shortcut.TargetPath = $newTarget
                 $shortcut.WorkingDirectory = $newWorkingDir
@@ -79,7 +74,6 @@ function Update-FirefoxShortcuts {
 }
 
 function Remove-PerUserFirefoxBinaries {
-    # Scans AppData and silently removes consumer binaries. Leaves Roaming profile data intact.
     $removedAny = $false
     foreach ($p in (Get-UserProfileDirs)) {
         $targets = @(
@@ -95,8 +89,6 @@ function Remove-PerUserFirefoxBinaries {
                     $removedAny = $true
                 }
                 catch {
-                    # Silent Deferral: If the user has Firefox open, we don't force close. 
-                    # We catch the locked-file error and defer deletion to the next Intune cycle.
                     Write-Output "WARN: Files in $t are locked by a running process. Deferring cleanup."
                     $removedAny = $true
                 }
@@ -106,8 +98,31 @@ function Remove-PerUserFirefoxBinaries {
     return $removedAny
 }
 
+function Remove-Legacy32BitFirefox {
+    if ([Environment]::Is64BitOperatingSystem) {
+        $x86Path = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox"
+        $helper = Join-Path -Path $x86Path -ChildPath "uninstall\helper.exe"
+        
+        if (Test-Path -LiteralPath $helper) {
+            Write-Output "Found legacy 32-bit Firefox. Executing uninstaller silently..."
+            try {
+                Start-Process -FilePath $helper -ArgumentList "/S" -Wait -PassThru -ErrorAction Stop | Out-Null
+                Write-Output "Legacy 32-bit uninstall completed."
+                Start-Sleep -Seconds 2 # Allow OS to release file locks
+            } catch {
+                Write-Output "WARN: Failed to run 32-bit uninstaller."
+            }
+        }
+        
+        # Cleanup lingering ghost binaries to satisfy vulnerability scanners
+        if (Test-Path -LiteralPath (Join-Path -Path $x86Path -ChildPath "firefox.exe")) {
+            Write-Output "Force removing lingering 32-bit binaries..."
+            Remove-Item -LiteralPath $x86Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-FirefoxMsiFileVersion {
-    # Reads the physical version of the executable in Program Files
     $paths = @(
         "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
         "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
@@ -123,10 +138,9 @@ function Get-FirefoxMsiFileVersion {
 }
 
 function Get-MsiPath {
-    # Dynamically locates the MSI file next to where the script is running
+    # Dynamically locates the unified MSI file next to where the script is running
     $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $name = if ([Environment]::Is64BitOperatingSystem) { $MsiName64 } else { $MsiName32 }
-    return (Join-Path -Path $scriptDir -ChildPath $name)
+    return (Join-Path -Path $scriptDir -ChildPath $MsiName)
 }
 
 # ==============================================================================
@@ -138,31 +152,31 @@ try {
     # 1) Clear out rogue consumer binaries from user profiles
     $perUserRemoved = Remove-PerUserFirefoxBinaries
 
-    # 2) Check if the System Version is missing or out of date
+    # 2) Scrub legacy 32-bit System installs (if applicable)
+    Remove-Legacy32BitFirefox
+
+    # 3) Check if the System Version is missing or out of date
     $installedVersion = Get-FirefoxMsiFileVersion
     $needsInstall = (-not $installedVersion -or $installedVersion -lt $TargetVersion)
 
-    # 3) Install or Upgrade the Enterprise MSI
+    # 4) Install or Upgrade the Enterprise MSI
     if ($needsInstall) {
         $msiPath = Get-MsiPath
         if (-not (Test-Path -LiteralPath $msiPath)) { throw "MSI not found: $msiPath" }
 
         Write-Output "Installing Enterprise MSI: $msiPath"
-        # /i = install, ALLUSERS=1 = System-wide, /qn = silent, /norestart = suppress reboots
         $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" ALLUSERS=1 /qn /norestart" -Wait -PassThru
         Write-Output "MSI exit code: $($proc.ExitCode)"
     } else {
         Write-Output "Enterprise MSI already meets target ($installedVersion >= $TargetVersion)."
     }
 
-    # 4) Clean up duplicates and redirect user pins AFTER the MSI exists
+    # 5) Clean up duplicates and redirect user pins AFTER the MSI exists
     Update-FirefoxShortcuts
 
-    # Exit cleanly to Intune
     exit 0 
 }
 catch {
     Write-Output "ERROR: $($_.Exception.Message)"
-    # Exit 1 tells Intune the installation failed
     exit 1
 }
