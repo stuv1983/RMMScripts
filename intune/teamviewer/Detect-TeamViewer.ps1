@@ -1,38 +1,65 @@
 <#
 .SYNOPSIS
-    Detects TeamViewer presence on Windows workstations for Intune Uninstall Assignment.
+    Hardened Detection for TeamViewer Eradication.
 .DESCRIPTION
-    Exit 0 = TeamViewer detected (Tells Intune: "Target found, run the Uninstall script")
-    Exit 1 = Not detected / Not a workstation (Tells Intune: "Already clean, do nothing")
+    Returns Exit 0 if TeamViewer is found (triggering the Uninstall script).
+    Returns Exit 1 if the device is clean or not a workstation.
 #>
 
-[CmdletBinding()]
-param()
-
-# --- Workstation Guardrail ---
+# --- STEP 1: WORKSTATION GUARDRAIL ---
+# ProductType 1 = Workstation. We skip Servers (3) and DCs (2) to prevent 
+# accidental removal from critical support infrastructure.
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
 if (-not $os -or $os.ProductType -ne 1) { 
-    Write-Output "Not a workstation. Compliant by default."
+    Write-Output "Not a workstation. Skipping detection."
     exit 1 
 }
 
-# --- Installed Detection (Registry) ---
-$UninstallPaths = @(
-  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+$targetFound = $false
+
+# --- STEP 2: REGISTRY DETECTION (HKLM) ---
+# Anchored Regex: We use '^TeamViewer\b' to ensure we match "TeamViewer" 
+# or "TeamViewer Host" while avoiding false positives like "TeamViewerMeeting".
+$pattern = "^TeamViewer\b" 
+$registryPaths = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
 
-$installed = foreach ($p in $UninstallPaths) {
-  Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -match 'TeamViewer' } |
-    Select-Object DisplayName, DisplayVersion
+$installedApps = Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue | 
+    Where-Object { $_.DisplayName -split ' ' | Select-Object -First 1 -match $pattern }
+
+if ($installedApps) {
+    Write-Output "NON-COMPLIANT: Found TeamViewer registry entry: $($installedApps.DisplayName)"
+    $targetFound = $true
 }
 
-if ($installed) {
-    Write-Output "TeamViewer detected. Remediation required."
-    $installed | ForEach-Object { Write-Output (" - {0} (v{1})" -f $_.DisplayName, $_.DisplayVersion) }
-    exit 0
-} else {
-    Write-Output "TeamViewer not found. Device is clean."
-    exit 1
+# --- STEP 3: SERVICE DETECTION ---
+# Catch "Ghost" installs where the files/registry are gone but the service remains.
+if (Get-Service -Name "*TeamViewer*" -ErrorAction SilentlyContinue) {
+    Write-Output "NON-COMPLIANT: TeamViewer background service detected."
+    $targetFound = $true
 }
+
+# --- STEP 4: PER-USER APPDATA DETECTION ---
+# We scan user profiles because TeamViewer "Consumer" installs often bypass HKLM.
+$skipList = @("All Users","Default","Default User","Public","WDAGUtilityAccount","DefaultAppPool","Administrator")
+$userProfiles = Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue | 
+                Where-Object { $skipList -notcontains $_.Name }
+
+foreach ($u in $userProfiles) {
+    $checkPaths = @(
+        (Join-Path $u.FullName "AppData\Local\TeamViewer\TeamViewer.exe"),
+        (Join-Path $u.FullName "AppData\Roaming\TeamViewer\TeamViewer.exe")
+    )
+    foreach ($cp in $checkPaths) {
+        if (Test-Path -LiteralPath $cp) { 
+            Write-Output "NON-COMPLIANT: Per-user binary found in $($u.Name)'s AppData."
+            $targetFound = $true; break 
+        }
+    }
+    if ($targetFound) { break }
+}
+
+# --- STEP 5: EXIT LOGIC ---
+if ($targetFound) { exit 0 } else { exit 1 }
