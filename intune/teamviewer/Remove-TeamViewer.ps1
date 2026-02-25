@@ -4,22 +4,31 @@
 .DESCRIPTION
     Forcibly removes all TeamViewer footprints, cleans up orphan services,
     and wipes per-user AppData to prevent detection loops.
+
+.NOTES
+    NAME: Remove-TeamViewer
+    AUTHOR: Stu    
+#>
 #>
 
 # Restore error visibility to ensure failures are logged in Intune/RMM
 $ErrorActionPreference = "Continue" 
 
 # --- CONFIGURATION TOGGLES ---
-$WaitIfActive = $true       # Set to $true to delay if a remote session is active
+$AllowOnServers = $false     # Set to $true to allow uninstall on Servers and Domain Controllers
+$WaitIfActive = $true        # Set to $true to delay if a remote session is active
 $CleanPortableEXEs = $false  # Set to $true to hunt/delete portable EXEs in Downloads/Desktop
 $rebootRequired = $false
 $failed = $false
 
 # --- STEP 0: WORKSTATION GUARDRAIL ---
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-if (-not $os -or $os.ProductType -ne 1) { 
+
+if ((-not $os -or $os.ProductType -ne 1) -and -not $AllowOnServers) { 
     Write-Output "Target is not a workstation. Aborting uninstall for safety."
     exit 0 
+} elseif ($os -and $os.ProductType -ne 1 -and $AllowOnServers) {
+    Write-Output "Target is a server, but `$AllowOnServers is enabled. Proceeding with eradication..."
 }
 
 # --- STEP 1A: OPTIONAL WAIT LOOP ---

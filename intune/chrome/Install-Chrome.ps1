@@ -10,6 +10,10 @@
     3. (SCORCHED EARTH) Force-uninstalls any System-Level Chrome EXEs.
     4. Installs the 64-bit Enterprise MSI.
     5. Redirects all shortcuts to the new MSI path.
+
+    .NOTES
+    NAME: Install-Chrome
+    AUTHOR: Stu
 #>
 
 $ErrorActionPreference = "Stop"

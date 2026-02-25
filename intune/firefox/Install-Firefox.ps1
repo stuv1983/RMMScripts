@@ -2,13 +2,6 @@
 .SYNOPSIS
   Remediate-Firefox-EnterpriseMigration.ps1
   Installation/Remediation script for Intune Win32 App.
-.DESCRIPTION
-  Actions performed:
-  1. Deletes rogue per-user Firefox binaries from AppData.
-  2. Scrubs legacy 32-bit System installations if running on a 64-bit OS.
-  3. Installs or upgrades the Enterprise MSI system-wide.
-  4. Deletes duplicate personal desktop shortcuts.
-  5. Rewires Taskbar and Start Menu shortcuts to point to the new Enterprise path.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -22,112 +15,202 @@ $MsiName = "Firefox Setup 147.0.4.msi"
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
-function Get-UserProfileDirs {
-    $skip = @("All Users","Default","Default User","Public","WDAGUtilityAccount")
-    Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $skip -notcontains $_.Name }
-}
+function Wait-ForFirefoxToClose {
+    Write-Output "--- PHASE 0: PATIENT PROCESS GATE ---"
+    $maxWaitMinutes = 45
+    $timer = [Diagnostics.Stopwatch]::StartNew()
 
-function Update-FirefoxShortcuts {
-    Write-Output "Scanning for per-user Firefox shortcuts to redirect or remove..."
-    $shell = New-Object -ComObject WScript.Shell
-    
-    $newTarget = if ([Environment]::Is64BitOperatingSystem) {
-        Join-Path -Path $env:ProgramFiles -ChildPath "Mozilla Firefox\firefox.exe"
-    } else {
-        Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox\firefox.exe"
+    Write-Output "Checking if Firefox is actively running..."
+
+    while (Get-Process -Name "firefox" -ErrorAction SilentlyContinue) {
+        if ($timer.Elapsed.TotalMinutes -ge $maxWaitMinutes) {
+            Write-Output "WARN: Firefox has been open for over $maxWaitMinutes minutes."
+            Write-Output "Deferring migration (Exit 1618) to prevent Intune timeout."
+            $timer.Stop()
+            exit 1618
+        }
+        Write-Output "Firefox is running. Waiting 60 seconds..."
+        Start-Sleep -Seconds 60
     }
-    $newWorkingDir = Split-Path -Path $newTarget -Parent
-
-    $searchPaths = @(
-        "C:\Users\*\Desktop\*.lnk",
-        "C:\Users\Public\Desktop\*.lnk",
-        "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk",
-        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\*.lnk",
-        "C:\Users\*\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\*.lnk"
-    )
-
-    $links = Get-ChildItem -Path $searchPaths -ErrorAction SilentlyContinue
-    
-    foreach ($link in $links) {
-        try {
-            $shortcut = $shell.CreateShortcut($link.FullName)
-            $target = $shortcut.TargetPath
-            
-            if ($target -match "(?i)AppData\\Local\\Mozilla.*firefox\.exe" -or $target -match "(?i)Mozilla Firefox\\firefox\.exe") {
-                
-                # Prevent the "Two Shortcut" bug: Delete personal desktop shortcuts since the MSI makes a Public one
-                if ($link.FullName -match "(?i)C:\\Users\\[^\\]+\\Desktop\\" -and $link.FullName -notmatch "(?i)C:\\Users\\Public\\") {
-                    Write-Output "Removing duplicate per-user desktop shortcut: $($link.FullName)"
-                    Remove-Item -LiteralPath $link.FullName -Force -ErrorAction SilentlyContinue
-                    continue
-                }
-
-                Write-Output "Redirecting/Fixing shortcut: $($link.FullName)"
-                $shortcut.TargetPath = $newTarget
-                $shortcut.WorkingDirectory = $newWorkingDir
-                $shortcut.IconLocation = "$newTarget,0"
-                $shortcut.Save()
-            }
-        } catch {}
-    }
+    Write-Output "Firefox is closed! Proceeding with migration..."
+    $timer.Stop()
 }
 
 function Remove-PerUserFirefoxBinaries {
-    $removedAny = $false
-    foreach ($p in (Get-UserProfileDirs)) {
-        $targets = @(
-            (Join-Path -Path $p.FullName -ChildPath "AppData\Local\Mozilla\Firefox"),
-            (Join-Path -Path $p.FullName -ChildPath "AppData\Local\Firefox")
+    Write-Output "--- PHASE 1: SURGICAL PER-USER CLEANUP ---"
+    $users = Get-ChildItem -LiteralPath "C:\Users" -Directory -Force -ErrorAction SilentlyContinue
+    
+    foreach ($u in $users) {
+        if ($u.Name -match "^(All Users|Default|Default User|Public|WDAGUtilityAccount|Administrator)$") { continue }
+        
+        $pathsToCheck = @(
+            "$($u.FullName)\AppData\Local\Mozilla Firefox",
+            "$($u.FullName)\AppData\Local\Mozilla\Firefox",
+            "$($u.FullName)\AppData\Local\Firefox"
         )
-
-        foreach ($t in $targets) {
-            if (Test-Path -LiteralPath $t) {
-                Write-Output "Attempting to remove per-user Firefox binaries: $t"
-                try {
-                    Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction Stop
-                    $removedAny = $true
-                }
-                catch {
-                    Write-Output "WARN: Files in $t are locked by a running process. Deferring cleanup."
-                    $removedAny = $true
+        
+        foreach ($folder in $pathsToCheck) {
+            $exe = "$folder\firefox.exe"
+            if (Test-Path -LiteralPath $exe) {
+                Write-Output ">> Found rogue binary at: $exe"
+                $items = Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+                foreach ($item in $items) {
+                    # GUARDRAIL: Protect profile caches, crash reports, and telemetry
+                    if ($item.Name -match "(?i)^(Profiles|Crash Reports|Pending Pings|Data|Telemetry)$") {
+                        Write-Output "   [Protected] User data kept: $($item.Name)"
+                        continue
+                    }
+                    try {
+                        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+                        Write-Output "   [Deleted] $($item.Name)"
+                    } catch {
+                        Write-Output "   [WARN] Could not delete $($item.Name)."
+                    }
                 }
             }
         }
     }
-    return $removedAny
+}
+
+function Fix-FirefoxDowngradeLock {
+    Write-Output "--- PHASE 2A: DOWNGRADE LOCK CLEARANCE ---"
+    $users = Get-ChildItem -LiteralPath "C:\Users" -Directory -Force -ErrorAction SilentlyContinue
+    foreach ($u in $users) {
+        $profilesDir = "$($u.FullName)\AppData\Roaming\Mozilla\Firefox\Profiles"
+        if (Test-Path -LiteralPath $profilesDir) {
+            $profiles = Get-ChildItem -Path $profilesDir -Directory -ErrorAction SilentlyContinue
+            foreach ($prof in $profiles) {
+                $compatFile = "$($prof.FullName)\compatibility.ini"
+                if (Test-Path -LiteralPath $compatFile) {
+                    Remove-Item -LiteralPath $compatFile -Force -ErrorAction SilentlyContinue
+                    Write-Output "Cleared downgrade lock for profile: $($prof.Name)"
+                }
+            }
+        }
+    }
+}
+
+function Rebind-FirefoxProfiles {
+    Write-Output "--- PHASE 2B: SMART PROFILE REBINDING ---"
+    $users = Get-ChildItem -LiteralPath "C:\Users" -Directory -Force -ErrorAction SilentlyContinue
+    foreach ($u in $users) {
+        $ffAppData = "$($u.FullName)\AppData\Roaming\Mozilla\Firefox"
+        $profilesDir = "$ffAppData\Profiles"
+        $installsIni = "$ffAppData\installs.ini"
+        $profilesIni = "$ffAppData\profiles.ini"
+
+        if (-not (Test-Path -LiteralPath $profilesIni) -or -not (Test-Path -LiteralPath $profilesDir)) { continue }
+
+        # 1. Identify the ACTUALLY ACTIVE profile by finding the newest places.sqlite database
+        $activeProfilePath = ""
+        $latestTime = [datetime]::MinValue
+        $profDirs = Get-ChildItem -Path $profilesDir -Directory -ErrorAction SilentlyContinue
+        
+        foreach ($pd in $profDirs) {
+            $dbFile = Join-Path -Path $pd.FullName -ChildPath "places.sqlite"
+            if (Test-Path -LiteralPath $dbFile) {
+                $lastWrite = (Get-Item -LiteralPath $dbFile).LastWriteTime
+                if ($lastWrite -gt $latestTime) {
+                    $latestTime = $lastWrite
+                    $activeProfilePath = "Profiles/$($pd.Name)"
+                }
+            }
+        }
+
+        # Fallback if places.sqlite doesn't exist
+        if (-not $activeProfilePath) {
+            foreach ($pd in $profDirs) { $activeProfilePath = "Profiles/$($pd.Name)"; break }
+        }
+
+        Write-Output ">> Target active profile identified as: $activeProfilePath"
+
+        # 2. Clear installs.ini
+        if (Test-Path -LiteralPath $installsIni) { Remove-Item -LiteralPath $installsIni -Force -ErrorAction SilentlyContinue }
+
+        # 3. Safely rebuild profiles.ini
+        $iniContent = Get-Content -LiteralPath $profilesIni
+        $newIniContent = @()
+        $skipInstallBlock = $false
+        $hasGeneral = $false
+        $hasStartWithLast = $false
+
+        foreach ($line in $iniContent) {
+            if ($line -match "^\[Install") { $skipInstallBlock = $true; continue }
+            if ($line -match "^\[" -and $line -notmatch "^\[Install") { $skipInstallBlock = $false }
+            
+            if (-not $skipInstallBlock) { 
+                if ($line -match "^\[General\]") { $hasGeneral = $true }
+                if ($line -match "^StartWithLastProfile=") { 
+                    $newIniContent += "StartWithLastProfile=1"
+                    $hasStartWithLast = $true
+                    continue
+                }
+                # Strip existing false Default=1 lines from old blocks
+                if ($line -match "^Default=1" -and $line -notmatch "^\[General\]") { continue }
+                $newIniContent += $line 
+            }
+        }
+
+        # Ensure [General] has StartWithLastProfile=1
+        if (-not $hasStartWithLast) {
+            $injected = @()
+            foreach ($l in $newIniContent) {
+                $injected += $l
+                if ($l -match "^\[General\]") { $injected += "StartWithLastProfile=1" }
+            }
+            if (-not $hasGeneral) {
+                $injected = @("[General]", "StartWithLastProfile=1", "Version=2", "") + $injected
+            }
+            $newIniContent = $injected
+        }
+
+        # Inject Default=1 specifically into our active profile block
+        $finalIni = @()
+        foreach ($line in $newIniContent) {
+            $finalIni += $line
+            if ($line -match "^Path=(.*)") {
+                if ($matches[1].Trim() -replace '\\','/' -eq $activeProfilePath -replace '\\','/') {
+                    $finalIni += "Default=1"
+                }
+            }
+        }
+
+        # Inject the static Mozilla Installation Hashes
+        $finalIni += ""
+        $finalIni += "[Install308046B0AF4A39CB]"
+        $finalIni += "Default=$activeProfilePath"
+        $finalIni += "Locked=1"
+        $finalIni += ""
+        $finalIni += "[Install8216C80C92C4E828]"
+        $finalIni += "Default=$activeProfilePath"
+        $finalIni += "Locked=1"
+
+        $finalIni | Set-Content -LiteralPath $profilesIni -Force
+        Write-Output "Successfully bound Enterprise MSI to $activeProfilePath for $($u.Name)"
+    }
 }
 
 function Remove-Legacy32BitFirefox {
+    Write-Output "--- PHASE 3: LEGACY 32-BIT SCRUB ---"
     if ([Environment]::Is64BitOperatingSystem) {
         $x86Path = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox"
         $helper = Join-Path -Path $x86Path -ChildPath "uninstall\helper.exe"
-        
         if (Test-Path -LiteralPath $helper) {
-            Write-Output "Found legacy 32-bit Firefox. Executing uninstaller silently..."
             try {
                 Start-Process -FilePath $helper -ArgumentList "/S" -Wait -PassThru -ErrorAction Stop | Out-Null
-                Write-Output "Legacy 32-bit uninstall completed."
-                Start-Sleep -Seconds 2 # Allow OS to release file locks
-            } catch {
-                Write-Output "WARN: Failed to run 32-bit uninstaller."
-            }
+                Start-Sleep -Seconds 2 
+            } catch {}
         }
-        
-        # Cleanup lingering ghost binaries to satisfy vulnerability scanners
         if (Test-Path -LiteralPath (Join-Path -Path $x86Path -ChildPath "firefox.exe")) {
-            Write-Output "Force removing lingering 32-bit binaries..."
             Remove-Item -LiteralPath $x86Path -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "Force-removed lingering 32-bit binaries."
         }
     }
 }
 
 function Get-FirefoxMsiFileVersion {
-    $paths = @(
-        "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
-        "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-
+    $paths = @("$env:ProgramFiles\Mozilla Firefox\firefox.exe", "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe") | 
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) }
     foreach ($p in $paths) {
         try {
             $v = (Get-Item -LiteralPath $p).VersionInfo.ProductVersion
@@ -138,42 +221,59 @@ function Get-FirefoxMsiFileVersion {
 }
 
 function Get-MsiPath {
-    # Dynamically locates the unified MSI file next to where the script is running
     $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
     return (Join-Path -Path $scriptDir -ChildPath $MsiName)
+}
+
+function Update-FirefoxShortcuts {
+    Write-Output "--- PHASE 5: SHORTCUT REMEDIATION ---"
+    $shell = New-Object -ComObject WScript.Shell
+    $newTarget = if ([Environment]::Is64BitOperatingSystem) { Join-Path -Path $env:ProgramFiles -ChildPath "Mozilla Firefox\firefox.exe" } 
+                 else { Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox\firefox.exe" }
+    $newWorkingDir = Split-Path -Path $newTarget -Parent
+    $searchPaths = @("C:\Users\*\Desktop\*.lnk", "C:\Users\Public\Desktop\*.lnk", "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk", "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\*.lnk")
+    
+    foreach ($link in (Get-ChildItem -Path $searchPaths -ErrorAction SilentlyContinue)) {
+        try {
+            $shortcut = $shell.CreateShortcut($link.FullName)
+            if ($shortcut.TargetPath -match "(?i)Mozilla.*firefox\.exe") {
+                if ($link.FullName -match "(?i)C:\\Users\\[^\\]+\\Desktop\\" -and $link.FullName -notmatch "(?i)C:\\Users\\Public\\") {
+                    Remove-Item -LiteralPath $link.FullName -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+                $shortcut.TargetPath = $newTarget
+                $shortcut.WorkingDirectory = $newWorkingDir
+                $shortcut.Save()
+            }
+        } catch {}
+    }
 }
 
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
 try {
-    Write-Output "Starting Firefox enterprise migration remediation..."
-
-    # 1) Clear out rogue consumer binaries from user profiles
-    $perUserRemoved = Remove-PerUserFirefoxBinaries
-
-    # 2) Scrub legacy 32-bit System installs (if applicable)
+    Write-Output "Starting Firefox Enterprise migration..."
+    Wait-ForFirefoxToClose
+    Remove-PerUserFirefoxBinaries
+    Fix-FirefoxDowngradeLock
+    Rebind-FirefoxProfiles
     Remove-Legacy32BitFirefox
 
-    # 3) Check if the System Version is missing or out of date
+    Write-Output "--- PHASE 4: ENTERPRISE MSI DEPLOYMENT ---"
     $installedVersion = Get-FirefoxMsiFileVersion
-    $needsInstall = (-not $installedVersion -or $installedVersion -lt $TargetVersion)
-
-    # 4) Install or Upgrade the Enterprise MSI
-    if ($needsInstall) {
+    if (-not $installedVersion -or $installedVersion -lt $TargetVersion) {
+        $sysPath = "$env:ProgramFiles\Mozilla Firefox"
+        if (Test-Path -LiteralPath $sysPath) { Remove-Item -LiteralPath $sysPath -Recurse -Force -ErrorAction SilentlyContinue }
+        
         $msiPath = Get-MsiPath
         if (-not (Test-Path -LiteralPath $msiPath)) { throw "MSI not found: $msiPath" }
 
-        Write-Output "Installing Enterprise MSI: $msiPath"
         $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" ALLUSERS=1 /qn /norestart" -Wait -PassThru
-        Write-Output "MSI exit code: $($proc.ExitCode)"
-    } else {
-        Write-Output "Enterprise MSI already meets target ($installedVersion >= $TargetVersion)."
+        if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "MSI failed: $($proc.ExitCode)" }
     }
-
-    # 5) Clean up duplicates and redirect user pins AFTER the MSI exists
     Update-FirefoxShortcuts
-
+    Write-Output "Remediation complete."
     exit 0 
 }
 catch {

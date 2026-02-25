@@ -3,16 +3,27 @@
     Hardened Detection for TeamViewer Eradication.
 .DESCRIPTION
     Returns Exit 0 if TeamViewer is found (triggering the Uninstall script).
-    Returns Exit 1 if the device is clean or not a workstation.
+    Returns Exit 1 if the device is clean or if it's an excluded server.
+
+.NOTES
+    NAME: Detect-TeamViewer
+    AUTHOR: Stu    
+#>
 #>
 
+# --- CONFIGURATION TOGGLES ---
+$AllowOnServers = $false    # Set to $true to allow detection on Servers and Domain Controllers
+
 # --- STEP 1: WORKSTATION GUARDRAIL ---
-# ProductType 1 = Workstation. We skip Servers (3) and DCs (2) to prevent 
+# ProductType 1 = Workstation. We skip Servers (3) and DCs (2) by default to prevent 
 # accidental removal from critical support infrastructure.
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-if (-not $os -or $os.ProductType -ne 1) { 
+
+if ((-not $os -or $os.ProductType -ne 1) -and -not $AllowOnServers) { 
     Write-Output "Not a workstation. Skipping detection."
     exit 1 
+} elseif ($os -and $os.ProductType -ne 1 -and $AllowOnServers) {
+    Write-Output "Target is a server, but `$AllowOnServers is enabled. Proceeding with detection..."
 }
 
 $targetFound = $false

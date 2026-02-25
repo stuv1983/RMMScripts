@@ -2,6 +2,10 @@
 .SYNOPSIS
     Detect-Chrome.ps1
     Intune Win32 detection script (Strict MSI Option B - Update Only Mode)
+
+    .NOTES
+    NAME: Detect-Chrome
+    AUTHOR: Stu
 #>
 
 $TargetVersion = [version]"145.0.7632.110"
