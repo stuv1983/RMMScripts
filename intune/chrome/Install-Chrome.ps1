@@ -5,7 +5,7 @@
 .DESCRIPTION
     Actions performed:
     0. Patiently waits up to 45 minutes for the user to close Chrome.
-    1. Removes rogue per-user AppData Chrome binaries.
+    1. Removes rogue per-user AppData Chrome binaries safely (protecting User Data).
     2. Removes legacy 32-bit system installations.
     3. (SCORCHED EARTH) Force-uninstalls any System-Level Chrome EXEs.
     4. Installs the 64-bit Enterprise MSI.
@@ -57,11 +57,20 @@ function Remove-RogueChromeBinaries {
         Where-Object { $skip -notcontains $_.Name }
 
     foreach ($u in $users) {
+        # Target ONLY the Application folder, strictly avoiding the \User Data\ directory
         $appPath = Join-Path -Path $u.FullName -ChildPath "AppData\Local\Google\Chrome\Application"
-        if (Test-Path -LiteralPath $appPath) {
-            Write-Output "Attempting to remove per-user Chrome: $appPath"
-            try { Remove-Item -LiteralPath $appPath -Recurse -Force -ErrorAction Stop } 
-            catch { Write-Output "WARN: Could not remove $appPath. It may be locked by a background process." }
+        
+        # GUARDRAIL: Ensure we are deleting actual binaries, not an empty or hijacked folder
+        $exePath = Join-Path -Path $appPath -ChildPath "chrome.exe"
+        
+        if (Test-Path -LiteralPath $exePath) {
+            Write-Output "Per-user binaries confirmed. Safely removing application folder: $appPath"
+            try { 
+                Remove-Item -LiteralPath $appPath -Recurse -Force -ErrorAction Stop 
+            } 
+            catch { 
+                Write-Output "WARN: Could not remove $appPath. It may be locked by a background process." 
+            }
         }
     }
 }
