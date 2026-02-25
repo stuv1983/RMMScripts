@@ -1,20 +1,21 @@
 <#
 .SYNOPSIS
     Hard drive usage + per-user profile sizing + large folder/file reporting (RMM-ready).
-    Now includes specific alerting for User Downloads folders > 5GB.
+    Includes specific alerting for User Downloads folders > 5GB, accurate cloud-file sizing, 
+    and read-only SharePoint sync detection.
 
 .NOTES
-    Name:       HDDUsageCheck_v2.ps1
-    Author:     Stu Villanti (s.villanti@kenstra.com.au)
-    Modified:   Specific Downloads Check Added
-    Version:    5.1
+    Name:       HDDUsageCheck_v5.3.ps1
+    Author:     Stu Villanti
+    Modified:   Patched regex to properly exclude personal OneDrive from SharePoint syncs.
+    Version:    5.3
 
 .DESCRIPTION
     - Reports used/free space for all fixed drives.
     - Reports per-drive Recycle Bin usage.
-    - Lists each user profile under C:\Users with total size.
-    - Checks User "Downloads" folder specifically against a 5GB threshold.
-    - Reports other top-level folders/files >= general threshold.
+    - Lists each user profile under C:\Users with total size (ignoring cloud-only files).
+    - Checks User "Downloads" folder specifically against a threshold.
+    - Identifies synced SharePoint locations via HKEY_USERS (Read-Only).
     - Console-only output. Returns exit codes for RMM alerting.
 
 .EXIT CODES
@@ -27,18 +28,14 @@
 
 [CmdletBinding()]
 param(
-    [Parameter()] [int]$LowSpaceThreshold = 10,              # Warn if drive free % < this
-    [Parameter()] [string]$UserRoot = 'C:\Users',            # Root for user profiles
-    [Parameter()] [int]$LargeThresholdGB = 5,                # General flag for ANY folder/file >= this size (GB)
-    [Parameter()] [int]$DownloadsThresholdGB = 5,            # Specific alert threshold for Downloads folder (GB)
-    [Parameter()] [object]$IncludeHidden = $true,            # Include hidden/system items
+    [Parameter()] [int]$LowSpaceThreshold = 10,
+    [Parameter()] [string]$UserRoot = 'C:\Users',
+    [Parameter()] [int]$LargeThresholdGB = 5,
+    [Parameter()] [int]$DownloadsThresholdGB = 5,
+    [Parameter()] [object]$IncludeHidden = $true,
     [Parameter()] [object]$AsJson,
-
-    # Recycle Bin sizing
     [Parameter()] [object]$IncludeRecycleBin = $true,
     [Parameter()] [int]$RecycleBinThresholdGB = 5,
-
-    # Large-file reporting
     [Parameter()] [object]$IncludeLargeFiles = $true
 )
 
@@ -86,6 +83,7 @@ $recycleBinResults  = @()
 $profileResults     = @()
 $largeItemsResults  = @()
 $downloadsResults   = @()
+$sharePointResults  = @()
 
 # ---------------- HELPERS ----------------
 function To-GB {
@@ -97,7 +95,9 @@ function To-GB {
 function Get-FolderSizeBytes {
     param([Parameter(Mandatory)][string]$Path)
     try {
+        # Filter out cloud-only files to get actual disk usage
         return (Get-ChildItem -Path $Path -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
+                Where-Object { -not ($_.Attributes -match 'RecallOnDataAccess' -or $_.Attributes -match 'Offline') } |
                 Measure-Object -Property Length -Sum).Sum
     } catch {
         return 0
@@ -120,6 +120,32 @@ function Get-TopLevelNameFromProfilePath {
     }
 }
 
+function Get-SharePointSyncFolders {
+    $syncPaths = @()
+    try {
+        # Safe, read-only iteration of loaded user profiles
+        $userSIDs = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match 'S-1-5-21-[\d\-]+$' }
+        
+        foreach ($sid in $userSIDs) {
+            $regPath = "$($sid.PSPath)\Software\SyncEngines\Providers\OneDrive"
+            if (Test-Path $regPath) {
+                $syncKeys = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue
+                foreach ($key in $syncKeys) {
+                    $mountPoint = (Get-ItemProperty -Path $key.PSPath -Name "MountPoint" -ErrorAction SilentlyContinue).MountPoint
+                    # Filter out standard personal AND business OneDrive roots to isolate SharePoint
+                    if ($mountPoint -and ($mountPoint -notmatch "\\OneDrive$") -and ($mountPoint -notmatch "\\OneDrive - ")) {
+                        if ($syncPaths -notcontains $mountPoint) {
+                            $syncPaths += $mountPoint
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+    return $syncPaths
+}
+
 function Get-ProfileStatsSinglePass {
     param(
         [Parameter(Mandatory)][string]$User,
@@ -135,23 +161,28 @@ function Get-ProfileStatsSinglePass {
         Get-ChildItem -Path $ProfilePath -Recurse -File -Force:$IncludeHidden -ErrorAction SilentlyContinue |
         ForEach-Object {
             $f = $_
-            $len = [int64]$f.Length
+            
+            # Skip cloud-only placeholders so they don't skew the physical size
+            $isCloudOnly = ($f.Attributes -match 'RecallOnDataAccess') -or ($f.Attributes -match 'Offline')
+            
+            if (-not $isCloudOnly) {
+                $len = [int64]$f.Length
+                $total += $len
 
-            $total += $len
+                $top = Get-TopLevelNameFromProfilePath -ProfilePath $ProfilePath -FileFullPath $f.FullName
+                if (-not $bytesByTop.ContainsKey($top)) { $bytesByTop[$top] = [int64]0 }
+                $bytesByTop[$top] += $len
 
-            $top = Get-TopLevelNameFromProfilePath -ProfilePath $ProfilePath -FileFullPath $f.FullName
-            if (-not $bytesByTop.ContainsKey($top)) { $bytesByTop[$top] = [int64]0 }
-            $bytesByTop[$top] += $len
-
-            if ($IncludeLargeFiles -and ($len -ge $ThresholdBytes)) {
-                $largeFiles.Add([pscustomobject]@{
-                    ItemType = 'File'
-                    User     = $User
-                    Name     = $f.Name
-                    SizeGB   = To-GB $len
-                    Path     = $f.FullName
-                    Modified = $f.LastWriteTime
-                }) | Out-Null
+                if ($IncludeLargeFiles -and ($len -ge $ThresholdBytes)) {
+                    $largeFiles.Add([pscustomobject]@{
+                        ItemType = 'File'
+                        User     = $User
+                        Name     = $f.Name
+                        SizeGB   = To-GB $len
+                        Path     = $f.FullName
+                        Modified = $f.LastWriteTime
+                    }) | Out-Null
+                }
             }
         }
     } catch { }
@@ -197,6 +228,17 @@ foreach ($d in $drives) {
         $LowSpaceFound = $true
         Write-Report ("WARNING: {0} low on space (< {1}% free)" -f $d.DeviceID, $LowSpaceThreshold) -ForegroundColor Yellow
     }
+}
+
+# ---------------- SHAREPOINT SYNC DETECTION ----------------
+Write-Report "`n=== Synced SharePoint Locations ===`n"
+$sharePointResults = Get-SharePointSyncFolders
+if ($sharePointResults.Count -gt 0) {
+    foreach ($sp in $sharePointResults) {
+        Write-Report "Found Sync: $sp"
+    }
+} else {
+    Write-Report "No active SharePoint syncs detected."
 }
 
 # ---------------- RECYCLE BIN ----------------
@@ -252,7 +294,6 @@ if (-not (Test-Path $UserRoot)) {
     $downloadsThresholdBytes = [int64]($DownloadsThresholdGB * 1GB)
     $profileStats = @()
 
-    # 1. Gather stats
     foreach ($p in $profiles) {
         $stats = Get-ProfileStatsSinglePass -User $p.Name -ProfilePath $p.FullName -ThresholdBytes $generalThresholdBytes
         
@@ -264,17 +305,14 @@ if (-not (Test-Path $UserRoot)) {
         }
     }
 
-    # 2. Print summary table
     if ($profileResults.Count -gt 0 -and -not $AsJson) {
         $profileResults | Sort-Object SizeGB -Descending | Format-Table -AutoSize
     }
 
-    # 3. Analyze specific items (Downloads & Large Folders)
     foreach ($stats in $profileStats) {
         Write-Report ""
         Write-Report ("--- {0} ({1}) ---" -f $stats.User, $stats.Path)
 
-        # --- SPECIAL CHECK: DOWNLOADS FOLDER ---
         if ($stats.BytesByTopFolder.ContainsKey('Downloads')) {
             $dlBytes = [int64]$stats.BytesByTopFolder['Downloads']
             $dlGB = To-GB $dlBytes
@@ -294,17 +332,12 @@ if (-not (Test-Path $UserRoot)) {
             Write-Report "Downloads folder: 0 GB (OK)"
         }
 
-        # --- CHECK OTHER LARGE ITEMS ---
         $bigFolders = @()
         foreach ($k in $stats.BytesByTopFolder.Keys) {
             $b = [int64]$stats.BytesByTopFolder[$k]
             
-            # Use general threshold for everything (including Downloads if it matches)
             if ($b -ge $generalThresholdBytes) {
-                # We set flag, but we don't need to double-warn if we just warned about Downloads above,
-                # though repeating it in the "Large Items" list below is standard behavior.
                 $LargeItemsFound = $true
-
                 $folderPath = if ($k -eq '(root)') { $stats.Path } else { Join-Path $stats.Path $k }
                 
                 $bigFolders += [pscustomobject]@{
@@ -317,7 +350,6 @@ if (-not (Test-Path $UserRoot)) {
             }
         }
 
-        # Report general large items
         if (($bigFolders.Count + $stats.LargeFiles.Count) -gt 0) {
             Write-Report ("Top folders/files >= {0} GB:" -f $LargeThresholdGB)
             if (-not $AsJson) {
@@ -333,10 +365,11 @@ Write-Report "`n=== Check complete ==="
 
 if ($AsJson) {
     [pscustomobject]@{
-        Version              = '5.1'
+        Version              = '5.3'
         LowSpaceFound        = $LowSpaceFound
         LargeItemsFound      = $LargeItemsFound
         DownloadsAlerts      = $downloadsResults
+        SharePointPaths      = $sharePointResults
         Drives               = $driveResults
         RecycleBins          = $recycleBinResults
         Profiles             = $profileResults

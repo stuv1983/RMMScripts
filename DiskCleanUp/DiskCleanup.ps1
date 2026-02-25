@@ -2,16 +2,18 @@
 <#
 .SYNOPSIS
   Automated Windows Disk Cleanup (CleanMgr) for RMM - Zero UI (Session 0).
+  Includes custom cleanup for per-user AppData\Local\Temp directories.
 
   .NOTES
     Name:       DiskCleanup.ps1
-    Author:     Stu Villanti (s.villanti@kenstra.com.au)
-    Version:    3.0.
+    Author:     Stu Villanti
+    Version:    3.1
     
 .DESCRIPTION
   - Configures Disk Cleanup categories via registry StateFlags.
   - Runs cleanmgr.exe via a temporary Scheduled Task as SYSTEM.
-  - This forces execution in Session 0, guaranteeing NO UI is shown to the user.
+  - Empties C:\Users\*\AppData\Local\Temp for all profiles.
+  - Forces execution in Session 0, guaranteeing NO UI is shown to the user.
   - Includes self-cleanup of tasks and timeout logic.
 
 .PARAMETER Mode
@@ -27,15 +29,13 @@ param(
 # 1. Environment & Safety Checks
 # ----------------------------
 
-# Run correlation ID for logs
 $RunId = [guid]::NewGuid().ToString('N')
 $ErrorActionPreference = 'Stop'
 
-# Normalise CheckOnly mode
 $CheckOnly = $false
 if ($Mode -match '^(test|check|dryrun)$') { $CheckOnly = $true }
 
-# Force 64-bit PowerShell (Critical for Registry Access on 64-bit OS)
+# Force 64-bit PowerShell
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
     $sysnativePS = Join-Path $env:WINDIR 'SysNative\WindowsPowerShell\v1.0\powershell.exe'
     if (Test-Path -LiteralPath $sysnativePS) {
@@ -70,7 +70,7 @@ function Format-Bytes {
     $units = @('B','KB','MB','GB','TB')
     $i = 0
     while ($Bytes -ge 1024 -and $i -lt 4) { $Bytes /= 1024; $i++ }
-    "{0:N2}{1}" -f $Bytes, $units[$i]
+    "{0:N2} {1}" -f $Bytes, $units[$i]
 }
 
 function Get-DiskFreeSnapshot {
@@ -99,6 +99,48 @@ function Set-CleanMgrRegistry {
     }
 }
 
+function Clear-UserTempFolders {
+    Write-Log "Starting cleanup of User AppData\Local\Temp folders..."
+    $userRoot = 'C:\Users'
+    $skipProfiles = @('Default', 'Default User', 'Public', 'All Users')
+    
+    $profiles = Get-ChildItem -Path $userRoot -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $skipProfiles -notcontains $_.Name }
+    
+    $totalFreedBytes = 0
+    
+    foreach ($p in $profiles) {
+        $tempPath = Join-Path $p.FullName 'AppData\Local\Temp'
+        if (Test-Path $tempPath) {
+            if ($CheckOnly) {
+                Write-Log "[DRYRUN] Would clean: $tempPath"
+            } else {
+                # Calculate size before deletion
+                $beforeSize = (Get-ChildItem -Path $tempPath -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                
+                # Delete contents (ignoring locked files gracefully)
+                Get-ChildItem -Path $tempPath -Force -ErrorAction SilentlyContinue | 
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                
+                # Calculate size after deletion
+                $afterSize = (Get-ChildItem -Path $tempPath -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                
+                $freed = $beforeSize - $afterSize
+                if ($freed -gt 0) {
+                    $totalFreedBytes += $freed
+                    Write-Log "Freed $(Format-Bytes $freed) from $($p.Name)'s Temp folder."
+                }
+            }
+        }
+    }
+    
+    if (-not $CheckOnly -and $totalFreedBytes -gt 0) {
+        Write-Log "Total freed from User Temp folders: $(Format-Bytes $totalFreedBytes)"
+    } elseif (-not $CheckOnly) {
+        Write-Log "No user temp files could be cleared (files may be locked or already clean)."
+    }
+}
+
 function Invoke-CleanMgrHidden {
     param(
         [string]$CleanMgrPath,
@@ -106,11 +148,10 @@ function Invoke-CleanMgrHidden {
         [int]$TimeoutSeconds = 3600
     )
 
-    # Clean up previous stuck tasks if RMM agent crashed previously
     Get-ScheduledTask | Where-Object TaskName -like 'DiskCleanup-RMM-*' | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
     $taskName = "DiskCleanup-RMM-$([guid]::NewGuid().ToString('N'))"
-    $mgrArgs  = "/SAGERUN:$ProfileId" # Renamed from $args to avoid conflict
+    $mgrArgs  = "/SAGERUN:$ProfileId"
 
     Write-Log "Creating Hidden Scheduled Task (SYSTEM/Session 0): $taskName"
     
@@ -150,29 +191,31 @@ if (-not $mutex.WaitOne(1000)) { Write-Log "Script already running." "WARN"; exi
 try {
     Write-Log "==== Starting Disk Cleanup Automation ===="
     
-    # Snapshot Before
     $before = Get-DiskFreeSnapshot
     $before.Values | ForEach-Object { Write-Log "Drive $($_.Drive): $(Format-Bytes $_.Free) Free" }
 
+    # 1. Clean User Temp Folders first
+    Clear-UserTempFolders
+
+    # 2. Configure and run CleanMgr for System tasks
     Set-CleanMgrRegistry
 
     $cleanmgr = Join-Path $env:SystemRoot 'System32\cleanmgr.exe'
     
     if ($CheckOnly) {
-        Write-Log "[DRYRUN] Skipping actual execution."
+        Write-Log "[DRYRUN] Skipping actual CleanMgr execution."
     } else {
         $res = Invoke-CleanMgrHidden -CleanMgrPath $cleanmgr -ProfileId $ProfileId
         Write-Log "CleanMgr execution finished. Exit Code: $res"
     }
 
-    # Snapshot After
     $after = Get-DiskFreeSnapshot
     foreach ($k in $after.Keys) {
         $b = $before[$k]; $a = $after[$k]
         if ($b -and $a) {
             $delta = $a.Free - $b.Free
             $sign = if ($delta -ge 0) {"+"} else {"-"}
-            Write-Log "Drive $k Result: $(Format-Bytes $a.Free) Free (Delta: $sign$(Format-Bytes ([math]::Abs($delta))))"
+            Write-Log "Drive $k Result: $(Format-Bytes $a.Free) Free (Total Space Reclaimed: $sign$(Format-Bytes ([math]::Abs($delta))))"
         }
     }
 }
