@@ -2,8 +2,8 @@
 .SYNOPSIS
     Mozilla Firefox Phase 2 Surgical Remediation & Profile Rebinding
 .DESCRIPTION
-    Executes a smart migration. Removes AppData binaries but maps the user's 
-    existing history and bookmarks to the new Enterprise MSI installation.
+    Executes a smart migration. Removes AppData binaries, maps user history to 
+    the new MSI, and rewires broken shortcuts to the new system path.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -50,18 +50,17 @@ if ($NeedsDestructiveFix) {
         Start-Sleep -Seconds 60
     }
 
-    # Smart Profile Rebinding Logic: Finds the most recently used profile database
+    # Smart Profile Rebinding Logic
     foreach ($u in $UserProfiles) {
         $ffAppData = "$($u.FullName)\AppData\Roaming\Mozilla\Firefox"
         $profilesDir = "$ffAppData\Profiles"
         $profilesIni = "$ffAppData\profiles.ini"
         
-        if (Test-Path $profilesIni -and (Test-Path $profilesDir)) {
+        if ((Test-Path $profilesIni) -and (Test-Path $profilesDir)) {
             $activeProfilePath = ""
             $latestTime = [datetime]::MinValue
             $profDirs = Get-ChildItem -Path $profilesDir -Directory -ErrorAction SilentlyContinue
             
-            # Locate the newest places.sqlite to identify the active user profile
             foreach ($pd in $profDirs) {
                 $dbFile = Join-Path $pd.FullName "places.sqlite"
                 if (Test-Path $dbFile) {
@@ -74,7 +73,6 @@ if ($NeedsDestructiveFix) {
             }
             if (-not $activeProfilePath -and $profDirs) { $activeProfilePath = "Profiles/$($profDirs[0].Name)" }
 
-            # Inject the Enterprise MSI Installation Hashes to lock the profile
             if ($activeProfilePath) {
                 Write-Output "Binding $($u.Name) to target Enterprise profile $activeProfilePath..."
                 $finalIni = @("[General]", "StartWithLastProfile=1", "Version=2", "")
@@ -85,7 +83,7 @@ if ($NeedsDestructiveFix) {
         }
     }
 
-    # Nuke AppData & x86 Directories (Binaries only, keeps \Roaming intact)
+    # Nuke AppData & x86 Directories
     foreach ($Profile in $UserProfiles) {
         $AppDir = Join-Path $Profile.FullName "AppData\Local\Mozilla Firefox"
         if (Test-Path $AppDir) { Remove-Item $AppDir -Recurse -Force -ErrorAction SilentlyContinue }
@@ -95,7 +93,37 @@ if ($NeedsDestructiveFix) {
     # Execute MSI
     $msiPath = Join-Path $PSScriptRoot $MsiName
     Write-Output "Executing MSI Deployment..."
-    Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" ALLUSERS=1 /qn /norestart" -Wait
+    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" ALLUSERS=1 /qn /norestart" -Wait -PassThru
+
+    # ------------------------------------------------------------------------
+    # 4. SHORTCUT REMEDIATION (Fix broken user icons)
+    # ------------------------------------------------------------------------
+    if ($Process.ExitCode -eq 0 -or $Process.ExitCode -eq 3010) {
+        Write-Output "Rewiring shortcuts to new 64-bit system path..."
+        $shell = New-Object -ComObject WScript.Shell
+        $newTarget = $FirefoxSystem64
+        $newWorkingDir = Split-Path -Path $newTarget -Parent
+
+        $searchPaths = @(
+            "C:\Users\*\Desktop\*.lnk",
+            "C:\Users\Public\Desktop\*.lnk",
+            "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk",
+            "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\*.lnk",
+            "C:\Users\*\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\*.lnk"
+        )
+        
+        foreach ($link in (Get-ChildItem -Path $searchPaths -ErrorAction SilentlyContinue)) {
+            try {
+                $shortcut = $shell.CreateShortcut($link.FullName)
+                # If the shortcut points to any old Firefox location, rewrite it to the new 64-bit path
+                if ($shortcut.TargetPath -match "(?i)Mozilla.*firefox\.exe") {
+                    $shortcut.TargetPath = $newTarget
+                    $shortcut.WorkingDirectory = $newWorkingDir
+                    $shortcut.Save()
+                }
+            } catch {}
+        }
+    }
 }
 
 Write-Output "Firefox Remediation Complete."
