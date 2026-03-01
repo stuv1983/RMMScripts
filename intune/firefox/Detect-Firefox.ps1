@@ -7,7 +7,9 @@
 
 $FirefoxSystem64 = "C:\Program Files\Mozilla Firefox\firefox.exe"
 $FirefoxSystem86 = "C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
-$MinimumVersion = [version]"120.0.0.0" # Update to your organizational security floor
+
+# FIXED: Ensure this uses the 2-part format (Major.Minor) to match Mozilla's native EXE versioning
+$MinimumVersion = [version]"148.0" 
 $AppDataInstallFound = $false
 
 # ------------------------------------------------------------------------
@@ -40,7 +42,7 @@ if (-not (Test-Path $FirefoxSystem64)) {
     exit 0
 }
 
-# Ensure we compare as [version] to prevent string logic errors (e.g. "9.0" > "10.0")
+# Ensure we compare as [version] to prevent string logic errors
 $CurrentVersion = [version](Get-Item $FirefoxSystem64).VersionInfo.ProductVersion
 if ($CurrentVersion -lt $MinimumVersion) {
     Write-Output "Non-Compliant (Exit 1): Firefox version $CurrentVersion is below floor $MinimumVersion."
@@ -63,5 +65,5 @@ if ($MaintenanceService.StartType -eq 'Disabled') {
     exit 1
 }
 
-Write-Output "Compliant (Exit 0): Firefox $CurrentVersion is governed and healthy."
+Write-Output "Compliant (Exit 0): Firefox $CurrentVersion is fully governed and healthy."
 exit 0
