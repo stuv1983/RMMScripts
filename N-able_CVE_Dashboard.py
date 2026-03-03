@@ -1,12 +1,16 @@
-# ==========================================
+# ==============================================================================
 # N-ABLE CVE REPORT MERGER & DASHBOARD UTILITY
-# ==========================================
+# Description: Merges N-able Vulnerability and RMM Device reports to create
+#              an actionable, Excel-based Executive Risk Dashboard for MSPs.
+# Features:    Executive risk metrics, stale device tracking, dynamic date 
+#              filtering, and automated triage sheet generation.
+# ==============================================================================
 
 import pandas as pd                  
 import tkinter as tk
 from tkinter import ttk              
 from tkinter import filedialog, messagebox 
-from tkcalendar import DateEntry      # <-- NEW IMPORT
+from tkcalendar import DateEntry      
 import re                            
 
 # ==========================================
@@ -14,7 +18,7 @@ import re
 # ==========================================
 
 def select_file(label_var):
-    """Opens a Windows file dialog to select a CSV or Excel file."""
+    """Opens a standard Windows file explorer dialog to select a CSV or Excel file."""
     file_path = filedialog.askopenfilename(
         filetypes=[("Data Files", "*.csv *.xlsx *.xls"), ("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls")]
     )
@@ -22,19 +26,21 @@ def select_file(label_var):
         label_var.set(file_path)
 
 def load_data(file_path):
-    """Loads data cleanly into pandas based on the file extension."""
+    """Detects the file extension and loads the data cleanly into a Pandas DataFrame."""
     if file_path.lower().endswith(('.xlsx', '.xls')):
         return pd.read_excel(file_path)
     else:
         return pd.read_csv(file_path)
 
 def normalize_device_name(name):
+    """Strips domain suffixes and slashes from device names to ensure accurate joining between reports."""
     name = str(name).strip().upper()
     if '\\' in name: name = name.split('\\')[-1] 
     if '.' in name: name = name.split('.')[0]   
     return name
 
 def get_base_product(prod_name):
+    """Cleans fractured product names (e.g., stripping 'x64' or version numbers) to group them accurately."""
     p = str(prod_name).strip()
     p = re.sub(r'\bx64\b', '', p, flags=re.IGNORECASE)
     p = re.sub(r'\bx86\b', '', p, flags=re.IGNORECASE)
@@ -44,6 +50,7 @@ def get_base_product(prod_name):
     return p.strip()
 
 def clean_sheet_name(name, used_names):
+    """Sanitizes product names to safely use them as Excel sheet tabs without crashing the workbook."""
     if pd.isna(name) or str(name).strip() == "": name = "Unknown Product"
     invalid_chars = r'[\[\]\:\*\?\/\\\'\000]'
     clean_name = re.sub(invalid_chars, '', str(name)).strip()
@@ -61,6 +68,7 @@ def clean_sheet_name(name, used_names):
     return final_name
 
 def extract_nvd_link(row):
+    """Scans the row for a valid CVE ID pattern and generates a direct hyperlink to the NIST NVD database."""
     cve_pattern = r'(CVE-\d{4}-\d{4,7})'  
     for col in ['CVE', 'CVE ID', 'Vulnerability Name', 'Name']:
         if col in row.index and pd.notna(row[col]):
@@ -72,6 +80,7 @@ def extract_nvd_link(row):
     return ""
 
 def make_cve_org_link(val):
+    """Wraps the raw Vulnerability Name string in a hyperlink pointing to cve.org."""
     val_str = str(val) if not isinstance(val, str) else val
     if pd.isna(val) or val_str.strip() == "" or val_str.lower() == 'nan': return val
     
@@ -85,12 +94,14 @@ def make_cve_org_link(val):
     return val
 
 def determine_device_type(os_string):
+    """Tags the device as a Server or Workstation based on the RMM OS description."""
     val = str(os_string).lower()
     if val == 'nan' or val == 'unknown': return 'Unknown'
     if 'server' in val: return 'Server'
     return 'Workstation'
 
 def parse_last_response(val):
+    """Parses various N-able check-in string formats into sortable Python Datetime objects."""
     val = str(val).strip()
     epoch = pd.to_datetime('1900-01-01') 
     if val in ["Not Found in RMM", "N/A", ""]: return epoch
@@ -114,6 +125,7 @@ def parse_last_response(val):
     return epoch
 
 def get_col_letter(col_idx):
+    """Converts a 0-indexed column number into an Excel column letter (e.g., 0 -> A, 1 -> B)."""
     letter = ''
     col_idx += 1
     while col_idx > 0:
@@ -122,6 +134,7 @@ def get_col_letter(col_idx):
     return letter
 
 def toggle_rmm_state():
+    """Disables the RMM file selection entry if the user checks 'Skip Device Report'."""
     if skip_rmm_var.get():
         rmm_entry.config(state=tk.DISABLED)
         rmm_button.config(state=tk.DISABLED)
@@ -130,7 +143,7 @@ def toggle_rmm_state():
         rmm_button.config(state=tk.NORMAL)
 
 def toggle_date_state():
-    """Enables or disables the calendar widget based on the checkbox."""
+    """Enables or disables the calendar dropdown based on the 'Show All Dates' checkbox."""
     if show_all_dates_var.get():
         cal.config(state='disabled')
     else:
@@ -141,6 +154,7 @@ def toggle_date_state():
 # ==========================================
 
 def load_vulnerability_data(file_path):
+    """Loads, cleans, renames columns, and structures the primary N-able Vulnerability Report."""
     df_vuln = load_data(file_path)
     
     vuln_rename_dict = {}
@@ -176,6 +190,7 @@ def load_vulnerability_data(file_path):
     return df_vuln
 
 def load_rmm_data(file_path):
+    """Loads, cleans, and restructures the N-able Device Inventory / RMM Asset Report."""
     df_rmm = load_data(file_path)
     col_lower = {c.lower(): c for c in df_rmm.columns}
     
@@ -211,6 +226,7 @@ def load_rmm_data(file_path):
     return df_rmm.drop_duplicates(subset=['Device_Join'], keep='first')
 
 def merge_data(df_vuln, df_rmm, skip_rmm):
+    """Joins the structured Vulnerability data with the RMM endpoint check-in data."""
     if not skip_rmm and df_rmm is not None:
         merged_df = pd.merge(df_vuln, df_rmm[['Device_Join', 'Last Response', 'Device Type']], left_on='Name_Join', right_on='Device_Join', how='left')
         merged_df['Last Response'] = merged_df['Last Response'].fillna("Not Found in RMM")
@@ -229,7 +245,7 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
 # ==========================================
 
 def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold, product_to_sheet, header_format, link_format):
-    """Builds the main dashboard and metrics view cleanly without charts."""
+    """Builds the main Executive Risk Dashboard using a clean, chart-free 2x2 grid layout."""
     overview_sheet = workbook.add_worksheet('Overview')
     
     # --- CALCULATING EXECUTIVE METRICS ---
@@ -248,16 +264,15 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     servers_affected = filtered_for_sheets_df[filtered_for_sheets_df['Device Type'] == 'Server']['Name'].nunique()
     server_impact_pct = f"{round((servers_affected / total_servers) * 100, 1)}%" if total_servers > 0 else "0%"
 
-    now = pd.Timestamp.now()
-    valid_dates_mask = filtered_for_sheets_df['_Sort_Time'] > pd.to_datetime('1950-01-01')
-    stale_7 = filtered_for_sheets_df[valid_dates_mask & (filtered_for_sheets_df['_Sort_Time'] < now - pd.Timedelta(days=7))]['Name'].nunique()
-    stale_30 = filtered_for_sheets_df[valid_dates_mask & (filtered_for_sheets_df['_Sort_Time'] < now - pd.Timedelta(days=30))]['Name'].nunique()
+    # Missing Devices (Filtered by Score)
+    missing_devices_list = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] == "Not Found in RMM"]['Name'].unique()
+    missing_devices_count = len(missing_devices_list)
 
     # ==========================================
     # 1. EXECUTIVE BANNER (Top Row Horizontal)
     # ==========================================
     overview_sheet.write('A1', 'Exploitability Risk', header_format)
-    overview_sheet.write('A2', 'KEV CVEs'); overview_sheet.write('B2', kev_cves)
+    overview_sheet.write('A2', 'KEV (Known Exploited Vulnerabilities) CVEs'); overview_sheet.write('B2', kev_cves)
     overview_sheet.write('A3', 'Devices w/ KEV'); overview_sheet.write('B3', kev_devices)
     overview_sheet.write('A4', 'Known Exploits'); overview_sheet.write('B4', exploit_cves)
 
@@ -266,10 +281,6 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     overview_sheet.write('E3', 'Unique Devices'); overview_sheet.write('F3', unique_devices)
     overview_sheet.write('E4', 'Avg per Device'); overview_sheet.write('F4', avg_per_device)
     overview_sheet.write('E5', 'Servers Impacted'); overview_sheet.write('F5', f"{servers_affected} ({server_impact_pct})")
-
-    overview_sheet.write('I1', f'Stale Devices (Score {threshold}+)', header_format)
-    overview_sheet.write('I2', '> 7 Days Offline'); overview_sheet.write('J2', stale_7)
-    overview_sheet.write('I3', '> 30 Days Offline'); overview_sheet.write('J3', stale_30)
 
     # ==========================================
     # 2. DATA TABLES (Two-Column Layout)
@@ -300,19 +311,6 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
         overview_sheet.write(p_idx, 1, count)
         p_idx += 1
 
-    missing_row = p_idx + 2
-    overview_sheet.write(missing_row, 0, f"Devices Not Found in RMM (Score {threshold}+)", header_format)
-    missing_devices = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] == "Not Found in RMM"]['Name'].unique()
-    
-    m_idx = missing_row + 1
-    if len(missing_devices) == 0:
-        overview_sheet.write(m_idx, 0, "All devices synced")
-    else:
-        for dev in sorted(missing_devices):
-            overview_sheet.write(m_idx, 0, str(dev))
-            m_idx += 1
-
-
     # --- RIGHT COLUMN (Col E) ---
     overview_sheet.write(row_tables, 4, f'Devices by Type (Score {threshold}+)', header_format)
     dt_counts = filtered_for_sheets_df.groupby('Device Type')['Name'].nunique()
@@ -337,14 +335,26 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     overview_sheet.write(row_res + 2, 4, "Unresolved")
     overview_sheet.write_formula(row_res + 2, 5, f"={formula_unresolved}")
 
+    # Moved Missing Devices to Right Column, under Resolution Status
+    missing_row = row_res + 4
+    overview_sheet.write(missing_row, 4, f"Devices Not Found in RMM (Score {threshold}+, All Dates)", header_format)
+    
+    m_idx = missing_row + 1
+    if missing_devices_count == 0:
+        overview_sheet.write(m_idx, 4, "All devices synced")
+    else:
+        for dev in sorted(missing_devices_list):
+            overview_sheet.write(m_idx, 4, str(dev))
+            m_idx += 1
+
     # ==========================================
     # CLEANUP & FORMATTING
     # ==========================================
     overview_sheet.set_column('A:A', 38)
-    overview_sheet.set_column('E:E', 35)
-    overview_sheet.set_column('I:I', 20)
+    overview_sheet.set_column('E:E', 48) # Widened for the new missing devices header
 
 def build_all_detections_sheet(writer, merged_df, link_format, missing_row_format):
+    """Builds the raw, unfiltered data sheet containing all vulnerabilities and mappings."""
     merged_df_export = merged_df.copy()
     for col in ['Name_Join', 'Device_Join', 'Base Product']:
         if col in merged_df_export.columns: merged_df_export.drop(columns=[col], inplace=True)
@@ -384,6 +394,7 @@ def build_all_detections_sheet(writer, merged_df, link_format, missing_row_forma
         })
 
 def build_product_sheets(writer, filtered_for_sheets_df, product_to_sheet, link_format, missing_row_format):
+    """Generates individual, filtered triage tabs for each affected product suite."""
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type', 'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index', 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
 
     for product, group in filtered_for_sheets_df.groupby('Base Product'):
@@ -429,6 +440,7 @@ def build_product_sheets(writer, filtered_for_sheets_df, product_to_sheet, link_
 # ==========================================
 
 def process_reports():
+    """Main execution block: Coordinates data loading, filtering, and Excel export."""
     vuln_path = vuln_var.get()
     rmm_path = rmm_var.get()
     skip_rmm = skip_rmm_var.get()
@@ -453,11 +465,15 @@ def process_reports():
         df_rmm = None if skip_rmm else load_rmm_data(rmm_path)
         merged_df = merge_data(df_vuln, df_rmm, skip_rmm)
 
-        # --- NEW: Filter by Calendar Date ---
+        # 2. Filter by Calendar Date (if enabled)
         if not show_all_dates_var.get():
             try:
                 cutoff_date = pd.to_datetime(date_var.get())
-                merged_df = merged_df[merged_df['_Sort_Time'] >= cutoff_date]
+                # Keep active devices OR devices completely missing from RMM
+                merged_df = merged_df[
+                    (merged_df['_Sort_Time'] >= cutoff_date) | 
+                    (merged_df['Last Response'] == "Not Found in RMM")
+                ]
             except Exception as e:
                 progress.stop()
                 progress.destroy()
@@ -470,21 +486,21 @@ def process_reports():
             messagebox.showwarning("No Data", "No vulnerability records found matching the specified date filter and thresholds.")
             return
 
-        # 2. Get Output Destination
+        # 3. Get Output Destination
         output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
         if not output_file: 
             progress.stop()
             progress.destroy()
             return 
 
-        # 3. Setup Excel Environment
+        # 4. Setup Excel Environment
         filtered_for_sheets_df = merged_df[merged_df['Vulnerability Score'] >= threshold].copy()
         used_sheet_names = set(['overview', 'all detections'])
         product_to_sheet = {}
         for product, _ in filtered_for_sheets_df.groupby('Base Product'):
             product_to_sheet[product] = clean_sheet_name(product, used_sheet_names)
 
-        # 4. Write Excel File
+        # 5. Write Excel File
         with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
             workbook = writer.book
             
@@ -510,7 +526,7 @@ def process_reports():
 # ==========================================
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
-# Increased height from 440 to 520 to fit the calendar layout
+# Set height to 520 to comfortably fit the calendar layout
 root.geometry("540x520")
 
 vuln_var = tk.StringVar()
@@ -532,7 +548,7 @@ tk.Checkbutton(root, text="Skip Device Report (Disables 'Last Response')", varia
 tk.Label(root, text="3. Score Threshold (Show in Tabs)", font=('Arial', 10, 'bold')).pack(pady=5)
 tk.Entry(root, textvariable=score_var, width=10).pack()
 
-# --- NEW: Calendar Filter Block ---
+# Calendar Filter Block
 tk.Label(root, text="4. RMM Check-in Cutoff Date", font=('Arial', 10, 'bold')).pack(pady=5)
 date_frame = tk.Frame(root)
 date_frame.pack()
