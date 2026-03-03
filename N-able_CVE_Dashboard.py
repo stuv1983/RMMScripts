@@ -261,11 +261,11 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
 # --- EXCEL GENERATION FUNCTIONS ---
 # ==========================================
 
-def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold, product_to_sheet, header_format, link_format):
+def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df, threshold, product_to_sheet, header_format, link_format):
     """Builds the main Executive Risk Dashboard using a clean, chart-free 2x2 grid layout."""
     overview_sheet = workbook.add_worksheet('Overview')
     
-    # --- CALCULATING EXECUTIVE METRICS ---
+    # --- CALCULATING EXECUTIVE METRICS (Uses ALL valid threshold devices) ---
     is_kev = filtered_for_sheets_df['CISA KEV'].astype(str).str.strip().str.lower().isin(['yes', 'true', '1', 'y'])
     is_exploit = filtered_for_sheets_df['Has Known Exploit'].astype(str).str.strip().str.lower().isin(['yes', 'true', '1', 'y'])
 
@@ -315,8 +315,9 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
         r_sev += 1
 
     row_prod = max(r_sev + 2, 14)
+    # --- Top 10 Products strictly uses triage_df (actionable devices only) ---
     overview_sheet.write(row_prod, 0, f'Top 10 Products (Score {threshold}+)', header_format)
-    prod_counts = filtered_for_sheets_df.groupby('Base Product')['Name'].nunique().sort_values(ascending=False).head(10)
+    prod_counts = triage_df.groupby('Base Product')['Name'].nunique().sort_values(ascending=False).head(10)
     
     p_idx = row_prod + 1
     for prod, count in prod_counts.items():
@@ -352,7 +353,7 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     overview_sheet.write(row_res + 2, 4, "Unresolved")
     overview_sheet.write_formula(row_res + 2, 5, f"={formula_unresolved}")
 
-    # Moved Missing Devices to Right Column, under Resolution Status
+    # Missing Devices
     missing_row = row_res + 4
     overview_sheet.write(missing_row, 4, f"Devices Not Found in RMM (Score {threshold}+, All Dates)", header_format)
     
@@ -368,10 +369,10 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     # CLEANUP & FORMATTING
     # ==========================================
     overview_sheet.set_column('A:A', 38)
-    overview_sheet.set_column('E:E', 48) # Widened for the new missing devices header
+    overview_sheet.set_column('E:E', 48)
 
 def build_all_detections_sheet(writer, merged_df, link_format, missing_row_format):
-    """Builds the raw, unfiltered data sheet containing all vulnerabilities and mappings."""
+    """Builds the raw data sheet containing all threshold vulnerabilities and mappings."""
     merged_df_export = merged_df.copy()
     for col in ['Name_Join', 'Device_Join', 'Base Product']:
         if col in merged_df_export.columns: merged_df_export.drop(columns=[col], inplace=True)
@@ -404,17 +405,18 @@ def build_all_detections_sheet(writer, merged_df, link_format, missing_row_forma
     if 'Last Response' in cols_export_list:
         lr_idx = cols_export_list.index('Last Response')
         lr_col_letter = get_col_letter(lr_idx)
+        # Keeps red highlighting on the All Detections tab
         ws_all.conditional_format(1, 0, len(merged_df_export), len(cols_export_list) - 1, {
             'type': 'formula',
             'criteria': f'=${lr_col_letter}2="Not Found in RMM"',
             'format': missing_row_format
         })
 
-def build_product_sheets(writer, filtered_for_sheets_df, product_to_sheet, link_format, missing_row_format):
-    """Generates individual, filtered triage tabs for each affected product suite."""
+def build_product_sheets(writer, triage_df, product_to_sheet, link_format):
+    """Generates filtered triage tabs exclusively for managed devices."""
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type', 'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index', 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
 
-    for product, group in filtered_for_sheets_df.groupby('Base Product'):
+    for product, group in triage_df.groupby('Base Product'):
         sheet_name = product_to_sheet[product]
         group = group.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
         group = group.sort_values(by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
@@ -442,15 +444,23 @@ def build_product_sheets(writer, filtered_for_sheets_df, product_to_sheet, link_
             ws_p.set_column(final_cols.index('Name'), final_cols.index('Name'), 25)
         if 'Device Type' in final_cols:
             ws_p.set_column(final_cols.index('Device Type'), final_cols.index('Device Type'), 15)
-        
-        if 'Last Response' in final_cols:
-            lr_idx = final_cols.index('Last Response')
-            lr_col_letter = get_col_letter(lr_idx)
-            ws_p.conditional_format(1, 0, len(group), len(final_cols) - 1, {
-                'type': 'formula',
-                'criteria': f'=${lr_col_letter}2="Not Found in RMM"',
-                'format': missing_row_format
-            })
+
+def build_raw_data_sheet(writer, raw_df):
+    """Dumps the completely unfiltered, pre-threshold dataset to a final tab for reference/auditing."""
+    raw_df_export = raw_df.copy()
+    
+    # Strip out the Python-specific helper columns we created during the merge so it looks clean
+    for col in ['Name_Join', 'Device_Join', 'Base Product', '_Sort_Time']:
+        if col in raw_df_export.columns: 
+            raw_df_export.drop(columns=[col], inplace=True)
+            
+    # Write to Excel
+    raw_df_export.to_excel(writer, sheet_name='Raw Data', index=False)
+    
+    # Apply standard autofilter
+    ws_raw = writer.sheets['Raw Data']
+    ws_raw.autofilter(0, 0, len(raw_df_export), len(raw_df_export.columns) - 1)
+
 
 # ==========================================
 # --- ORCHESTRATOR / UI CONTROLLER ---
@@ -482,17 +492,13 @@ def process_reports():
         df_rmm = None if skip_rmm else load_rmm_data(rmm_path)
         merged_df = merge_data(df_vuln, df_rmm, skip_rmm)
 
+        # --- NEW: Capture raw, totally unfiltered dataset before date or score filters apply ---
+        raw_df = merged_df.copy()
+
         # 2. Filter by Calendar Date (if enabled)
         if not show_all_dates_var.get():
             try:
-                # Capture the user-selected date from the UI calendar widget
                 cutoff_date = pd.to_datetime(date_var.get())
-                
-                # Filter the dataset to include ONLY:
-                # Condition A: Devices whose check-in date is on or after the selected cutoff date.
-                # Condition B: Devices that are completely missing from the RMM database.
-                # Note: Condition B prevents the date filter from accidentally deleting unmanaged endpoints 
-                #       from the triage dashboard, as their parsed timestamp is an artificial 1900-01-01.
                 merged_df = merged_df[
                     (merged_df['_Sort_Time'] >= cutoff_date) | 
                     (merged_df['Last Response'] == "Not Found in RMM")
@@ -518,9 +524,11 @@ def process_reports():
 
         # 4. Setup Excel Environment
         filtered_for_sheets_df = merged_df[merged_df['Vulnerability Score'] >= threshold].copy()
-        used_sheet_names = set(['overview', 'all detections'])
+        triage_df = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] != "Not Found in RMM"].copy()
+        
+        used_sheet_names = set(['overview', 'all detections', 'raw data'])
         product_to_sheet = {}
-        for product, _ in filtered_for_sheets_df.groupby('Base Product'):
+        for product, _ in triage_df.groupby('Base Product'):
             product_to_sheet[product] = clean_sheet_name(product, used_sheet_names)
 
         # 5. Write Excel File
@@ -531,9 +539,12 @@ def process_reports():
             header_format = workbook.add_format({'bold': True, 'font_size': 12, 'bg_color': '#D9D9D9', 'border': 1})
             missing_row_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
 
-            build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold, product_to_sheet, header_format, link_format)
+            build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df, threshold, product_to_sheet, header_format, link_format)
             build_all_detections_sheet(writer, merged_df, link_format, missing_row_format)
-            build_product_sheets(writer, filtered_for_sheets_df, product_to_sheet, link_format, missing_row_format)
+            build_product_sheets(writer, triage_df, product_to_sheet, link_format)
+            
+            # --- NEW: Append the raw data to the very end of the workbook ---
+            build_raw_data_sheet(writer, raw_df)
 
         progress.stop()
         progress.destroy()
