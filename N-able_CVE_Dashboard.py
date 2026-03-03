@@ -134,13 +134,30 @@ def get_col_letter(col_idx):
     return letter
 
 def toggle_rmm_state():
-    """Disables the RMM file selection entry if the user checks 'Skip Device Report'."""
+    """
+    Controls RMM file selection AND whether date filtering is allowed.
+    Date filtering is only valid when Device Report is loaded.
+    """
     if skip_rmm_var.get():
+        # Disable RMM file selection
         rmm_entry.config(state=tk.DISABLED)
         rmm_button.config(state=tk.DISABLED)
+
+        # Force 'Show All Dates' ON and lock it
+        show_all_dates_var.set(True)
+        show_all_dates_checkbox.config(state=tk.DISABLED)
+
+        # Disable calendar explicitly
+        cal.config(state='disabled')
     else:
         rmm_entry.config(state=tk.NORMAL)
         rmm_button.config(state=tk.NORMAL)
+
+        # Re-enable checkbox
+        show_all_dates_checkbox.config(state=tk.NORMAL)
+
+        # Re-evaluate calendar state
+        toggle_date_state()
 
 def toggle_date_state():
     """Enables or disables the calendar dropdown based on the 'Show All Dates' checkbox."""
@@ -272,7 +289,7 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, threshold,
     # 1. EXECUTIVE BANNER (Top Row Horizontal)
     # ==========================================
     overview_sheet.write('A1', 'Exploitability Risk', header_format)
-    overview_sheet.write('A2', 'KEV (Known Exploited Vulnerabilities) CVEs'); overview_sheet.write('B2', kev_cves)
+    overview_sheet.write('A2', 'KEV CVEs'); overview_sheet.write('B2', kev_cves)
     overview_sheet.write('A3', 'Devices w/ KEV'); overview_sheet.write('B3', kev_devices)
     overview_sheet.write('A4', 'Known Exploits'); overview_sheet.write('B4', exploit_cves)
 
@@ -468,8 +485,14 @@ def process_reports():
         # 2. Filter by Calendar Date (if enabled)
         if not show_all_dates_var.get():
             try:
+                # Capture the user-selected date from the UI calendar widget
                 cutoff_date = pd.to_datetime(date_var.get())
-                # Keep active devices OR devices completely missing from RMM
+                
+                # Filter the dataset to include ONLY:
+                # Condition A: Devices whose check-in date is on or after the selected cutoff date.
+                # Condition B: Devices that are completely missing from the RMM database.
+                # Note: Condition B prevents the date filter from accidentally deleting unmanaged endpoints 
+                #       from the triage dashboard, as their parsed timestamp is an artificial 1900-01-01.
                 merged_df = merged_df[
                     (merged_df['_Sort_Time'] >= cutoff_date) | 
                     (merged_df['Last Response'] == "Not Found in RMM")
@@ -559,7 +582,13 @@ show_all_dates_var = tk.BooleanVar(value=True)
 cal = DateEntry(date_frame, selectmode='day', textvariable=date_var, date_pattern='yyyy-mm-dd', width=12)
 cal.pack(side=tk.LEFT, padx=5)
 
-tk.Checkbutton(date_frame, text="Show All Dates", variable=show_all_dates_var, command=toggle_date_state).pack(side=tk.LEFT)
+show_all_dates_checkbox = tk.Checkbutton(
+    date_frame,
+    text="Show All Dates",
+    variable=show_all_dates_var,
+    command=toggle_date_state
+)
+show_all_dates_checkbox.pack(side=tk.LEFT)
 toggle_date_state() # Initialize the default disabled state
 
 tk.Button(root, text="GENERATE COMPLETE DASHBOARD", command=process_reports, bg="#0078D7", fg="white", font=('Arial', 10, 'bold'), height=2).pack(pady=20)
