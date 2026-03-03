@@ -3,7 +3,8 @@
 # ==========================================
 
 import pandas as pd                  
-import tkinter as tk                 
+import tkinter as tk
+from tkinter import ttk              
 from tkinter import filedialog, messagebox 
 import re                            
 
@@ -20,7 +21,7 @@ def select_file(label_var):
         label_var.set(file_path)
 
 def load_data(file_path):
-    """Smartly loads data into pandas based on the file extension."""
+    """Loads data cleanly into pandas based on the file extension."""
     if file_path.lower().endswith(('.xlsx', '.xls')):
         return pd.read_excel(file_path)
     else:
@@ -69,9 +70,13 @@ def clean_sheet_name(name, used_names):
 
 def extract_nvd_link(row):
     """Scans the vulnerability name for a valid CVE ID and builds an NVD hyperlink."""
+    cve_pattern = r'(CVE-\d{4}-\d{4,7})'  
+    
     for col in ['CVE', 'CVE ID', 'Vulnerability Name', 'Name']:
         if col in row.index and pd.notna(row[col]):
-            match = re.search(r'(CVE-\d{4}-\d+)', str(row[col]), re.IGNORECASE)
+            # Handle non-string values
+            cell_value = str(row[col]) if not isinstance(row[col], str) else row[col]
+            match = re.search(cve_pattern, cell_value, re.IGNORECASE)
             if match:
                 cve_id = match.group(1).upper()
                 return f'=HYPERLINK("https://nvd.nist.gov/vuln/detail/{cve_id}", "View")'
@@ -79,11 +84,12 @@ def extract_nvd_link(row):
 
 def make_cve_org_link(val):
     """Wraps the original Vulnerability Name text in a cve.org hyperlink."""
-    val_str = str(val)
+    val_str = str(val) if not isinstance(val, str) else val
     if pd.isna(val) or val_str.strip() == "" or val_str.lower() == 'nan':
         return val
     
-    match = re.search(r'(CVE-\d{4}-\d+)', val_str, re.IGNORECASE)
+    cve_pattern = r'(CVE-\d{4}-\d{4,7})'
+    match = re.search(cve_pattern, val_str, re.IGNORECASE)
     if match:
         cve_id = match.group(1).upper()
         # Escape quotes for Excel formulas and truncate to prevent crashing on massive strings
@@ -170,6 +176,12 @@ def process_reports():
         messagebox.showerror("Error", "Please select the Device Inventory / RMM Report.")
         return
 
+    # Start progress indicator
+    progress = ttk.Progressbar(root, mode='indeterminate')
+    progress.pack(pady=10)
+    progress.start()
+    root.update()
+
     try:
         threshold = float(score_var.get())
         
@@ -177,9 +189,45 @@ def process_reports():
         try:
             df_vuln = load_data(vuln_path)
         except Exception as e:
+            progress.stop()
+            progress.destroy()
             messagebox.showerror("File Error", f"Could not read Vulnerability Report:\n{e}")
             return
+            
+        # =====================================================================
+        # EXPLICIT COLUMN RENAMING
+        # =====================================================================
+        vuln_rename_dict = {}
+        for col in df_vuln.columns:
+            c_lower = str(col).strip().lower()
+            if c_lower in ['asset name', 'device name', 'endpoint']:
+                vuln_rename_dict[col] = 'Name'
+            elif c_lower in ['vulnerability id', 'cve id', 'cve']:
+                vuln_rename_dict[col] = 'Vulnerability Name'
+            elif c_lower in ['cvss score', 'cvss v3.1 base score', 'cvss v3 base score', 'base score', 'score']:
+                vuln_rename_dict[col] = 'Vulnerability Score'
+            elif c_lower in ['affected products', 'product']:
+                vuln_rename_dict[col] = 'Affected Products'
+            elif c_lower in ['severity', 'risk']:
+                vuln_rename_dict[col] = 'Vulnerability Severity'
+            elif c_lower in ['threat status', 'status']:
+                vuln_rename_dict[col] = 'Threat Status'
+                
+        df_vuln.rename(columns=vuln_rename_dict, inplace=True)
+
+        if 'Threat Status' in df_vuln.columns:
+            df_vuln = df_vuln[df_vuln['Threat Status'].astype(str).str.strip().str.upper() != 'RESOLVED']
         
+        # Ensure mandatory columns exist
+        if 'Name' not in df_vuln.columns: df_vuln['Name'] = 'Unknown Device'
+        if 'Vulnerability Name' not in df_vuln.columns: df_vuln['Vulnerability Name'] = 'Unknown CVE'
+        if 'Affected Products' not in df_vuln.columns: df_vuln['Affected Products'] = 'Unknown Product'
+        if 'Vulnerability Score' not in df_vuln.columns: df_vuln['Vulnerability Score'] = 0.0
+        if 'Vulnerability Severity' not in df_vuln.columns: df_vuln['Vulnerability Severity'] = 'Unknown'
+        
+        df_vuln['Vulnerability Name'] = df_vuln['Vulnerability Name'].fillna('Unknown CVE')
+        # =====================================================================
+
         df_vuln['Name_Join'] = df_vuln['Name'].apply(normalize_device_name)
         df_vuln['Affected Products'] = df_vuln['Affected Products'].fillna('Unknown Product')
         df_vuln['Base Product'] = df_vuln['Affected Products'].apply(get_base_product)
@@ -189,6 +237,8 @@ def process_reports():
             try:
                 df_rmm = load_data(rmm_path)
             except Exception as e:
+                progress.stop()
+                progress.destroy()
                 messagebox.showerror("File Error", f"Could not read Device Inventory Report:\n{e}")
                 return
             
@@ -199,6 +249,8 @@ def process_reports():
             if 'device name' in col_lower: dev_col = col_lower['device name']
             elif 'device' in col_lower: dev_col = col_lower['device']
             elif 'name' in col_lower: dev_col = col_lower['name']
+            elif 'asset name' in col_lower: dev_col = col_lower['asset name']
+            elif 'hostname' in col_lower: dev_col = col_lower['hostname']
                 
             if 'last response (local time)' in col_lower: resp_col = col_lower['last response (local time)']
             elif 'last response (utc)' in col_lower: resp_col = col_lower['last response (utc)']
@@ -215,6 +267,8 @@ def process_reports():
                     resp_col = 'Last Response'
                     os_col = 'OS'
                 else:
+                    progress.stop()
+                    progress.destroy()
                     messagebox.showerror("Format Error", "Could not identify 'Device name' and 'Last response' columns.")
                     return
             
@@ -238,7 +292,10 @@ def process_reports():
 
         # --- 3. EXPORT TO EXCEL ---
         output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
-        if not output_file: return 
+        if not output_file: 
+            progress.stop()
+            progress.destroy()
+            return 
 
         with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
             workbook = writer.book
@@ -319,11 +376,41 @@ def process_reports():
             })
             chart_prod.set_title({'name': 'Top 10 Affected Products'})
             overview_sheet.insert_chart('D16', chart_prod)
-            
+
             overview_sheet.set_column('A:A', 40)
             overview_sheet.autofilter(start_p_row, 0, p_idx - 1, 1)
 
-            missing_row = p_idx + 2
+            # ==========================================
+            # RESOLUTION STATUS OVERVIEW
+            # ==========================================
+            res_row = p_idx + 2
+            overview_sheet.write(res_row, 0, f'Resolution Status (All Products)', header_format)
+
+            if product_to_sheet:
+                formula_resolved = " + ".join([f"COUNTIF('{s}'!A:A, \"☑\")" for s in product_to_sheet.values()])
+                formula_unresolved = " + ".join([f"COUNTIF('{s}'!A:A, \"☐\")" for s in product_to_sheet.values()])
+            else:
+                formula_resolved = "0"
+                formula_unresolved = "0"
+
+            overview_sheet.write(res_row + 1, 0, "Resolved")
+            overview_sheet.write_formula(res_row + 1, 1, f"={formula_resolved}")
+
+            overview_sheet.write(res_row + 2, 0, "Unresolved")
+            overview_sheet.write_formula(res_row + 2, 1, f"={formula_unresolved}")
+
+            chart_res = workbook.add_chart({'type': 'pie'})
+            chart_res.add_series({
+                'name': 'Resolution Status',
+                'categories': ['Overview', res_row + 1, 0, res_row + 2, 0],
+                'values':     ['Overview', res_row + 1, 1, res_row + 2, 1],
+                'points': [{'fill': {'color': '#92D050'}}, {'fill': {'color': '#FF5050'}}] 
+            })
+            chart_res.set_title({'name': 'Resolved vs Unresolved'})
+            overview_sheet.insert_chart(f'K16', chart_res)
+
+            missing_row = res_row + 4
+
             overview_sheet.write(missing_row, 0, f"Devices Not Found in RMM (Score {threshold}+)", header_format)
             missing_devices = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] == "Not Found in RMM"]['Name'].unique()
             
@@ -343,7 +430,6 @@ def process_reports():
             for col in ['Name_Join', 'Device_Join', 'Base Product']:
                 if col in merged_df_export.columns: merged_df_export.drop(columns=[col], inplace=True)
             
-            # Generate the dual links (NVD in its column, cve.org in Vulnerability Name)
             merged_df_export['NVD'] = merged_df_export.apply(extract_nvd_link, axis=1)
             merged_df_export['Vulnerability Name'] = merged_df_export['Vulnerability Name'].apply(make_cve_org_link)
             
@@ -360,7 +446,6 @@ def process_reports():
             
             ws_all.autofilter(0, 0, len(merged_df_export), len(merged_df_export.columns) - 1)
             
-            # Explicitly format the link and width columns
             cols_export_list = merged_df_export.columns.tolist()
             if 'Vulnerability Name' in cols_export_list:
                 vn_idx = cols_export_list.index('Vulnerability Name')
@@ -383,7 +468,7 @@ def process_reports():
             # ==========================================
             # SHEETS 3+: PRODUCT TABS (Triage View)
             # ==========================================
-            cols_order = ['Vulnerability Name', 'Name', 'Device Type', 'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index', 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
+            cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type', 'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index', 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
 
             for product, group in filtered_for_sheets_df.groupby('Base Product'):
                 sheet_name = product_to_sheet[product]
@@ -391,7 +476,8 @@ def process_reports():
                 group = group.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
                 group = group.sort_values(by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
                 
-                # Apply dual linking
+                group.insert(0, 'Resolved', '☐')
+                
                 group['NVD'] = group.apply(extract_nvd_link, axis=1)
                 group['Vulnerability Name'] = group['Vulnerability Name'].apply(make_cve_org_link)
                 
@@ -401,7 +487,14 @@ def process_reports():
                 ws_p = writer.sheets[sheet_name]
                 ws_p.autofilter(0, 0, len(group), len(final_cols) - 1)
                 
-                # Explicit column sizing and blue text application
+                if 'Resolved' in final_cols:
+                    res_idx = final_cols.index('Resolved')
+                    ws_p.data_validation(1, res_idx, len(group), res_idx, {
+                        'validate': 'list',
+                        'source': ['☐', '☑']
+                    })
+                    ws_p.set_column(res_idx, res_idx, 10) 
+
                 if 'Vulnerability Name' in final_cols:
                     vn_idx = final_cols.index('Vulnerability Name')
                     ws_p.set_column(vn_idx, vn_idx, 25, link_format)
@@ -422,8 +515,14 @@ def process_reports():
                         'format': missing_row_format
                     })
 
+        # Clean up progress bar before final success message
+        progress.stop()
+        progress.destroy()
         messagebox.showinfo("Success", f"Full Dashboard saved to:\n{output_file}")
+        
     except Exception as e:
+        progress.stop()
+        progress.destroy()
         messagebox.showerror("Error", f"Processing failed: {e}")
 
 # ==========================================
@@ -431,7 +530,7 @@ def process_reports():
 # ==========================================
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
-root.geometry("540x420")
+root.geometry("540x440")
 vuln_var, rmm_var, score_var, skip_rmm_var = tk.StringVar(), tk.StringVar(), tk.StringVar(value="9.0"), tk.BooleanVar(value=False)
 
 tk.Label(root, text="1. Vulnerability Report (CSV or XLSX)", font=('Arial', 10, 'bold')).pack(pady=5)
