@@ -1,69 +1,65 @@
 <#
 .SYNOPSIS
-    Mozilla Firefox Phase 2 Enforcement Detection
-.DESCRIPTION
-    Validates Firefox compliance using file-based [version] retrieval and x86 architecture trapping.
+    Mozilla Firefox Lean Detection
+.NOTES
+    IMPORTANT: $MinimumVersion, $Firefox64Exe, $Firefox86Dir, and $RoguePaths
+    are intentionally duplicated from Install-Firefox.ps1. This is NOT a bug.
+    Intune evaluates this detection script independently in a separate process
+    and cannot share state with the install script. Update both files if values change.
 #>
 
-$FirefoxSystem64 = "C:\Program Files\Mozilla Firefox\firefox.exe"
-$FirefoxSystem86 = "C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
+# --- Constants ---
+# NOTE: Duplicated in Install-Firefox.ps1 by design. See .NOTES above.
+$Firefox64Exe   = "C:\Program Files\Mozilla Firefox\firefox.exe"
+$Firefox86Dir   = "C:\Program Files (x86)\Mozilla Firefox"
+$MinimumVersion = [version]"148.0"
 
-# FIXED: Ensure this uses the 2-part format (Major.Minor) to match Mozilla's native EXE versioning
-$MinimumVersion = [version]"148.0" 
-$AppDataInstallFound = $false
+$RoguePaths = @(
+    "AppData\Local\Mozilla Firefox",
+    "AppData\Local\Programs\Mozilla Firefox"
+)
 
-# ------------------------------------------------------------------------
-# 1. ARCHITECTURE & SHADOW IT TRAPS
-# ------------------------------------------------------------------------
-if (Test-Path $FirefoxSystem86) {
-    Write-Output "Non-Compliant (Exit 1): 32-bit Firefox installation detected."
+
+# 1. TRAP SHADOW IT & x86
+if (Test-Path $Firefox86Dir) {
+    Write-Output "Non-Compliant (Exit 1): 32-bit Firefox directory detected."
     exit 1
 }
 
-$ExcludedProfiles = @('Public', 'Default', 'Default User', 'All Users')
-$UserProfiles = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -notin $ExcludedProfiles }
+$UserProfiles = Get-ChildItem "C:\Users" -Directory |
+                Where-Object { Test-Path (Join-Path $_.FullName "NTUSER.DAT") }
 
 foreach ($Profile in $UserProfiles) {
-    if (Test-Path (Join-Path $Profile.FullName "AppData\Local\Mozilla Firefox\firefox.exe")) { 
-        $AppDataInstallFound = $true; break 
+    foreach ($RelativePath in $RoguePaths) {
+        if (Test-Path (Join-Path $Profile.FullName $RelativePath)) {
+            Write-Output "Non-Compliant (Exit 1): Rogue AppData installation detected in $($Profile.Name)."
+            exit 1
+        }
     }
 }
 
-if ($AppDataInstallFound) {
-    Write-Output "Non-Compliant (Exit 1): Rogue AppData installation detected."
-    exit 1
-}
 
-# ------------------------------------------------------------------------
-# 2. ESCAPE HATCH & VERSION FLOOR
-# ------------------------------------------------------------------------
-if (-not (Test-Path $FirefoxSystem64)) {
-    Write-Output "Compliant (Exit 0): Firefox is not installed."
+# 2. VALIDATE 64-BIT PRESENCE & VERSION
+# Exit 0 here means Firefox is simply absent — no rogue installs were found
+# above, so the environment is clean. The install script will deploy Firefox.
+# If your policy requires Firefox to already be present, change this to exit 1.
+if (-not (Test-Path $Firefox64Exe)) {
+    Write-Output "Compliant (Exit 0): Firefox is not installed (no rogue installs detected)."
     exit 0
 }
 
-# Ensure we compare as [version] to prevent string logic errors
-$CurrentVersion = [version](Get-Item $FirefoxSystem64).VersionInfo.ProductVersion
-if ($CurrentVersion -lt $MinimumVersion) {
-    Write-Output "Non-Compliant (Exit 1): Firefox version $CurrentVersion is below floor $MinimumVersion."
+try {
+    $CurrentVersion = [version]((Get-Item $Firefox64Exe).VersionInfo.ProductVersion)
+    if ($CurrentVersion -lt $MinimumVersion) {
+        Write-Output "Non-Compliant (Exit 1): Firefox version $CurrentVersion is below floor $MinimumVersion."
+        exit 1
+    }
+} catch {
+    Write-Output "Non-Compliant (Exit 1): Unable to parse 64-bit version string."
     exit 1
 }
 
-# ------------------------------------------------------------------------
-# 3. SERVICING ENGINE VALIDATION
-# ------------------------------------------------------------------------
-# The Mozilla Maintenance Service naturally sits at 'Manual' and 'Stopped'.
-$MaintenanceService = Get-Service -Name "MozillaMaintenance" -ErrorAction SilentlyContinue
 
-if ($null -eq $MaintenanceService) {
-    Write-Output "Non-Compliant (Exit 1): Maintenance Service is missing."
-    exit 1
-}
-
-if ($MaintenanceService.StartType -eq 'Disabled') {
-    Write-Output "Non-Compliant (Exit 1): Maintenance Service is Disabled."
-    exit 1
-}
-
-Write-Output "Compliant (Exit 0): Firefox $CurrentVersion is fully governed and healthy."
+# All checks passed
+Write-Output "Compliant (Exit 0): Environment is clean and up to date."
 exit 0
