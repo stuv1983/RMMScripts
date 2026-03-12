@@ -1,5 +1,5 @@
 # ==============================================================================
-# N-ABLE CVE REPORT MERGER & DASHBOARD UTILITY
+# N-ABLE CVE REPORT MERGER & DASHBOARD UTILITY (Refactored)
 # Description: Merges N-able Vulnerability and RMM Device reports to create
 #              an actionable, Excel-based Executive Risk Dashboard for MSPs.
 # Features:    Executive risk metrics, stale device tracking, dynamic date 
@@ -12,13 +12,16 @@ from tkinter import ttk
 from tkinter import filedialog, messagebox 
 from tkcalendar import DateEntry      
 import re                            
+import threading
+
+# Pre-compile regex for massive performance gains on large datasets
+CVE_PATTERN = re.compile(r'(CVE-\d{4}-\d{4,7})', re.IGNORECASE)
 
 # ==========================================
 # --- GENERAL HELPER FUNCTIONS ---
 # ==========================================
 
 def select_file(label_var):
-    """Opens a standard Windows file explorer dialog to select a CSV or Excel file."""
     file_path = filedialog.askopenfilename(
         filetypes=[("Data Files", "*.csv *.xlsx *.xls"), ("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls")]
     )
@@ -26,21 +29,17 @@ def select_file(label_var):
         label_var.set(file_path)
 
 def load_data(file_path):
-    """Detects the file extension and loads the data cleanly into a Pandas DataFrame."""
     if file_path.lower().endswith(('.xlsx', '.xls')):
         return pd.read_excel(file_path)
-    else:
-        return pd.read_csv(file_path)
+    return pd.read_csv(file_path)
 
 def normalize_device_name(name):
-    """Strips domain suffixes and slashes from device names to ensure accurate joining between reports."""
     name = str(name).strip().upper()
     if '\\' in name: name = name.split('\\')[-1] 
     if '.' in name: name = name.split('.')[0]   
     return name
 
 def get_base_product(prod_name):
-    """Cleans fractured product names (e.g., stripping 'x64' or version numbers) to group them accurately."""
     p = str(prod_name).strip()
     p = re.sub(r'\bx64\b', '', p, flags=re.IGNORECASE)
     p = re.sub(r'\bx86\b', '', p, flags=re.IGNORECASE)
@@ -50,11 +49,9 @@ def get_base_product(prod_name):
     return p.strip()
 
 def clean_sheet_name(name, used_names):
-    """Sanitizes product names to safely use them as Excel sheet tabs without crashing the workbook."""
     if pd.isna(name) or str(name).strip() == "": name = "Unknown Product"
     invalid_chars = r'[\[\]\:\*\?\/\\\'\000]'
-    clean_name = re.sub(invalid_chars, '', str(name)).strip()
-    clean_name = clean_name[:31].strip() 
+    clean_name = re.sub(invalid_chars, '', str(name)).strip()[:31].strip() 
     if not clean_name: clean_name = "Unknown Product"
         
     final_name = clean_name
@@ -67,25 +64,11 @@ def clean_sheet_name(name, used_names):
     used_names.add(final_name)
     return final_name
 
-def extract_nvd_link(row):
-    """Scans the row for a valid CVE ID pattern and generates a direct hyperlink to the NIST NVD database."""
-    cve_pattern = r'(CVE-\d{4}-\d{4,7})'  
-    for col in ['CVE', 'CVE ID', 'Vulnerability Name', 'Name']:
-        if col in row.index and pd.notna(row[col]):
-            cell_value = str(row[col]) if not isinstance(row[col], str) else row[col]
-            match = re.search(cve_pattern, cell_value, re.IGNORECASE)
-            if match:
-                cve_id = match.group(1).upper()
-                return f'=HYPERLINK("https://nvd.nist.gov/vuln/detail/{cve_id}", "View")'
-    return ""
-
 def make_cve_org_link(val):
-    """Wraps the raw Vulnerability Name string in a hyperlink pointing to cve.org."""
     val_str = str(val) if not isinstance(val, str) else val
     if pd.isna(val) or val_str.strip() == "" or val_str.lower() == 'nan': return val
     
-    cve_pattern = r'(CVE-\d{4}-\d{4,7})'
-    match = re.search(cve_pattern, val_str, re.IGNORECASE)
+    match = CVE_PATTERN.search(val_str)
     if match:
         cve_id = match.group(1).upper()
         display_text = val_str.replace('"', '""')
@@ -94,14 +77,12 @@ def make_cve_org_link(val):
     return val
 
 def determine_device_type(os_string):
-    """Tags the device as a Server or Workstation based on the RMM OS description."""
     val = str(os_string).lower()
     if val == 'nan' or val == 'unknown': return 'Unknown'
     if 'server' in val: return 'Server'
     return 'Workstation'
 
 def parse_last_response(val):
-    """Parses various N-able check-in string formats into sortable Python Datetime objects."""
     val = str(val).strip()
     epoch = pd.to_datetime('1900-01-01') 
     if val in ["Not Found in RMM", "N/A", ""]: return epoch
@@ -109,23 +90,19 @@ def parse_last_response(val):
     except: pass
     
     if val.startswith("overdue_"):
-        try:
-            clean_val = val.replace("overdue_", "").split(" -")[0]
-            return pd.to_datetime(clean_val)
+        try: return pd.to_datetime(val.replace("overdue_", "").split(" -")[0])
         except: pass
             
     if "days" in val or "hrs" in val:
         try:
-            days = 0
             match = re.search(r'(\d+)\s*days', val)
-            if match: days = int(match.group(1))
+            days = int(match.group(1)) if match else 0
             return pd.Timestamp.now() - pd.Timedelta(days=days)
         except: pass
             
     return epoch
 
 def get_col_letter(col_idx):
-    """Converts a 0-indexed column number into an Excel column letter (e.g., 0 -> A, 1 -> B)."""
     letter = ''
     col_idx += 1
     while col_idx > 0:
@@ -134,10 +111,6 @@ def get_col_letter(col_idx):
     return letter
 
 def toggle_rmm_state():
-    """
-    Controls RMM file selection AND whether date filtering is allowed.
-    Date filtering is only valid when Device Report is loaded.
-    """
     if skip_rmm_var.get():
         rmm_entry.config(state=tk.DISABLED)
         rmm_button.config(state=tk.DISABLED)
@@ -151,20 +124,14 @@ def toggle_rmm_state():
         toggle_date_state()
 
 def toggle_date_state():
-    """Enables or disables the calendar dropdown based on the 'Show All Dates' checkbox."""
-    if show_all_dates_var.get():
-        cal.config(state='disabled')
-    else:
-        cal.config(state='normal')
+    cal.config(state='disabled' if show_all_dates_var.get() else 'normal')
 
 # ==========================================
 # --- DATA PIPELINE FUNCTIONS ---
 # ==========================================
 
 def load_vulnerability_data(file_path):
-    """Loads, cleans, renames columns, and structures the primary N-able Vulnerability Report."""
     df_vuln = load_data(file_path)
-    
     vuln_rename_dict = {}
     for col in df_vuln.columns:
         c_lower = str(col).strip().lower()
@@ -180,16 +147,13 @@ def load_vulnerability_data(file_path):
     if 'Threat Status' in df_vuln.columns:
         df_vuln = df_vuln[df_vuln['Threat Status'].astype(str).str.strip().str.upper() != 'RESOLVED']
     
-    if 'Name' not in df_vuln.columns: df_vuln['Name'] = 'Unknown Device'
-    if 'Vulnerability Name' not in df_vuln.columns: df_vuln['Vulnerability Name'] = 'Unknown CVE'
-    if 'Affected Products' not in df_vuln.columns: df_vuln['Affected Products'] = 'Unknown Product'
-    if 'Vulnerability Score' not in df_vuln.columns: df_vuln['Vulnerability Score'] = 0.0
-    if 'Vulnerability Severity' not in df_vuln.columns: df_vuln['Vulnerability Severity'] = 'Unknown'
-    
-    if 'Has Known Exploit' not in df_vuln.columns: df_vuln['Has Known Exploit'] = 'No'
-    if 'CISA KEV' not in df_vuln.columns: df_vuln['CISA KEV'] = 'No'
-    if 'Risk Severity Index' not in df_vuln.columns: df_vuln['Risk Severity Index'] = 'Unknown'
-    
+    # Fill defaults
+    defaults = {'Name': 'Unknown Device', 'Vulnerability Name': 'Unknown CVE', 'Affected Products': 'Unknown Product', 
+                'Vulnerability Score': 0.0, 'Vulnerability Severity': 'Unknown', 'Has Known Exploit': 'No', 
+                'CISA KEV': 'No', 'Risk Severity Index': 'Unknown'}
+    for col, default in defaults.items():
+        if col not in df_vuln.columns: df_vuln[col] = default
+
     df_vuln['Vulnerability Name'] = df_vuln['Vulnerability Name'].fillna('Unknown CVE')
     df_vuln['Name_Join'] = df_vuln['Name'].apply(normalize_device_name)
     df_vuln['Affected Products'] = df_vuln['Affected Products'].fillna('Unknown Product')
@@ -198,10 +162,8 @@ def load_vulnerability_data(file_path):
     return df_vuln
 
 def load_rmm_data(file_path):
-    """Loads, cleans, and restructures the N-able Device Inventory / RMM Asset Report."""
     df_rmm = load_data(file_path)
     col_lower = {c.lower(): c for c in df_rmm.columns}
-    
     dev_col, resp_col, os_col = None, None, None
     
     if 'device name' in col_lower: dev_col = col_lower['device name']
@@ -221,9 +183,7 @@ def load_rmm_data(file_path):
     if not dev_col or not resp_col:
         if len(df_rmm.columns) == 9:
             df_rmm.columns = ['Type', 'Client', 'Site', 'Device', 'Description', 'OS', 'Username', 'Last Response', 'Last Boot']
-            dev_col = 'Device'
-            resp_col = 'Last Response'
-            os_col = 'OS'
+            dev_col, resp_col, os_col = 'Device', 'Last Response', 'OS'
         else:
             raise ValueError("Could not identify 'Device name' and 'Last response' columns in RMM data.")
     
@@ -234,7 +194,6 @@ def load_rmm_data(file_path):
     return df_rmm.drop_duplicates(subset=['Device_Join'], keep='first')
 
 def merge_data(df_vuln, df_rmm, skip_rmm):
-    """Joins the structured Vulnerability data with the RMM endpoint check-in data."""
     if not skip_rmm and df_rmm is not None:
         merged_df = pd.merge(df_vuln, df_rmm[['Device_Join', 'Last Response', 'Device Type']], left_on='Name_Join', right_on='Device_Join', how='left')
         merged_df['Last Response'] = merged_df['Last Response'].fillna("Not Found in RMM")
@@ -253,10 +212,8 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
 # ==========================================
 
 def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df, threshold, product_to_sheet, header_format, link_format):
-    """Builds the main Executive Risk Dashboard using a clean, chart-free 2x2 grid layout."""
     overview_sheet = workbook.add_worksheet('Overview')
     
-    # --- CALCULATING EXECUTIVE METRICS (Uses ALL valid threshold devices) ---
     is_kev = filtered_for_sheets_df['CISA KEV'].astype(str).str.strip().str.lower().isin(['yes', 'true', '1', 'y'])
     is_exploit = filtered_for_sheets_df['Has Known Exploit'].astype(str).str.strip().str.lower().isin(['yes', 'true', '1', 'y'])
 
@@ -272,13 +229,10 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df,
     servers_affected = filtered_for_sheets_df[filtered_for_sheets_df['Device Type'] == 'Server']['Name'].nunique()
     server_impact_pct = f"{round((servers_affected / total_servers) * 100, 1)}%" if total_servers > 0 else "0%"
 
-    # Missing Devices (Filtered by Score)
     missing_devices_list = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] == "Not Found in RMM"]['Name'].unique()
     missing_devices_count = len(missing_devices_list)
 
-    # ==========================================
-    # 1. EXECUTIVE BANNER (Top Row Horizontal)
-    # ==========================================
+    # 1. BANNER
     overview_sheet.write('A1', 'Exploitability Risk', header_format)
     overview_sheet.write('A2', 'KEV CVEs'); overview_sheet.write('B2', kev_cves)
     overview_sheet.write('A3', 'Devices w/ KEV'); overview_sheet.write('B3', kev_devices)
@@ -290,12 +244,8 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df,
     overview_sheet.write('E4', 'Avg per Device'); overview_sheet.write('F4', avg_per_device)
     overview_sheet.write('E5', 'Servers Impacted'); overview_sheet.write('F5', f"{servers_affected} ({server_impact_pct})")
 
-    # ==========================================
-    # 2. DATA TABLES (Two-Column Layout)
-    # ==========================================
+    # 2. DATA TABLES
     row_tables = 7 
-    
-    # --- LEFT COLUMN (Col A) ---
     overview_sheet.write(row_tables, 0, 'Unique CVEs by Severity', header_format)
     unique_cves_df = merged_df.drop_duplicates(subset=['Vulnerability Name']).copy()
     sev_counts = unique_cves_df['Vulnerability Severity'].value_counts()
@@ -306,21 +256,18 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df,
         r_sev += 1
 
     row_prod = max(r_sev + 2, 14)
-    # --- Top 10 Products strictly uses triage_df (actionable devices only) ---
     overview_sheet.write(row_prod, 0, f'Top 10 Products (Score {threshold}+)', header_format)
     prod_counts = triage_df.groupby('Base Product')['Name'].nunique().sort_values(ascending=False).head(10)
     
     p_idx = row_prod + 1
     for prod, count in prod_counts.items():
         if prod in product_to_sheet:
-            target = product_to_sheet[prod]
-            overview_sheet.write_url(p_idx, 0, f"internal:'{target}'!A1", string=str(prod), cell_format=link_format)
+            overview_sheet.write_url(p_idx, 0, f"internal:'{product_to_sheet[prod]}'!A1", string=str(prod), cell_format=link_format)
         else:
             overview_sheet.write(p_idx, 0, str(prod))
         overview_sheet.write(p_idx, 1, count)
         p_idx += 1
 
-    # --- RIGHT COLUMN (Col E) ---
     overview_sheet.write(row_tables, 4, f'Devices by Type (Score {threshold}+)', header_format)
     dt_counts = filtered_for_sheets_df.groupby('Device Type')['Name'].nunique()
     
@@ -338,13 +285,9 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df,
     else:
         formula_resolved, formula_unresolved = "0", "0"
 
-    overview_sheet.write(row_res + 1, 4, "Resolved")
-    overview_sheet.write_formula(row_res + 1, 5, f"={formula_resolved}")
+    overview_sheet.write(row_res + 1, 4, "Resolved"); overview_sheet.write_formula(row_res + 1, 5, f"={formula_resolved}")
+    overview_sheet.write(row_res + 2, 4, "Unresolved"); overview_sheet.write_formula(row_res + 2, 5, f"={formula_unresolved}")
 
-    overview_sheet.write(row_res + 2, 4, "Unresolved")
-    overview_sheet.write_formula(row_res + 2, 5, f"={formula_unresolved}")
-
-    # Missing Devices
     missing_row = row_res + 4
     overview_sheet.write(missing_row, 4, f"Devices Not Found in RMM (Score {threshold}+, All Dates)", header_format)
     
@@ -356,19 +299,19 @@ def build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df,
             overview_sheet.write(m_idx, 4, str(dev))
             m_idx += 1
 
-    # ==========================================
-    # CLEANUP & FORMATTING
-    # ==========================================
     overview_sheet.set_column('A:A', 38)
     overview_sheet.set_column('E:E', 48)
 
+def vectorize_nvd_links(df):
+    """Refactored: Vectorized regex extraction for massive performance improvement."""
+    extracted = df['Vulnerability Name'].str.extract(r'(CVE-\d{4}-\d{4,7})', flags=re.IGNORECASE)[0]
+    return extracted.apply(lambda x: f'=HYPERLINK("https://nvd.nist.gov/vuln/detail/{x.upper()}", "View")' if pd.notna(x) else "")
+
 def build_all_detections_sheet(writer, merged_df, link_format, missing_row_format):
-    """Builds the raw data sheet containing all threshold vulnerabilities and mappings."""
-    merged_df_export = merged_df.copy()
-    for col in ['Name_Join', 'Device_Join', 'Base Product']:
-        if col in merged_df_export.columns: merged_df_export.drop(columns=[col], inplace=True)
+    merged_df_export = merged_df.drop(columns=[c for c in ['Name_Join', 'Device_Join', 'Base Product', '_Sort_Time'] if c in merged_df.columns]).copy()
     
-    merged_df_export['NVD'] = merged_df_export.apply(extract_nvd_link, axis=1)
+    # Use fast vectorized extraction
+    merged_df_export['NVD'] = vectorize_nvd_links(merged_df_export)
     merged_df_export['Vulnerability Name'] = merged_df_export['Vulnerability Name'].apply(make_cve_org_link)
     
     cols = merged_df_export.columns.tolist()
@@ -376,34 +319,24 @@ def build_all_detections_sheet(writer, merged_df, link_format, missing_row_forma
         cols.insert(cols.index('Name') + 1, cols.pop(cols.index('Device Type')))
         merged_df_export = merged_df_export[cols]
 
-    merged_df_export = merged_df_export.sort_values(by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
-    if '_Sort_Time' in merged_df_export.columns: merged_df_export.drop(columns=['_Sort_Time'], inplace=True)
-
+    merged_df_export = merged_df_export.sort_values(by=['Vulnerability Score', 'Name'], ascending=[False, True])
     merged_df_export.to_excel(writer, sheet_name='All Detections', index=False)
+    
     ws_all = writer.sheets['All Detections']
     ws_all.autofilter(0, 0, len(merged_df_export), len(merged_df_export.columns) - 1)
     
     cols_export_list = merged_df_export.columns.tolist()
-    if 'Vulnerability Name' in cols_export_list:
-        vn_idx = cols_export_list.index('Vulnerability Name')
-        ws_all.set_column(vn_idx, vn_idx, 25, link_format)
-    if 'NVD' in cols_export_list:
-        nvd_idx = cols_export_list.index('NVD')
-        ws_all.set_column(nvd_idx, nvd_idx, 10, link_format)
-    if 'Name' in cols_export_list:
-        ws_all.set_column(cols_export_list.index('Name'), cols_export_list.index('Name'), 25)
+    if 'Vulnerability Name' in cols_export_list: ws_all.set_column(cols_export_list.index('Vulnerability Name'), cols_export_list.index('Vulnerability Name'), 25, link_format)
+    if 'NVD' in cols_export_list: ws_all.set_column(cols_export_list.index('NVD'), cols_export_list.index('NVD'), 10, link_format)
+    if 'Name' in cols_export_list: ws_all.set_column(cols_export_list.index('Name'), cols_export_list.index('Name'), 25)
     
     if 'Last Response' in cols_export_list:
-        lr_idx = cols_export_list.index('Last Response')
-        lr_col_letter = get_col_letter(lr_idx)
+        lr_col_letter = get_col_letter(cols_export_list.index('Last Response'))
         ws_all.conditional_format(1, 0, len(merged_df_export), len(cols_export_list) - 1, {
-            'type': 'formula',
-            'criteria': f'=${lr_col_letter}2="Not Found in RMM"',
-            'format': missing_row_format
+            'type': 'formula', 'criteria': f'=${lr_col_letter}2="Not Found in RMM"', 'format': missing_row_format
         })
 
 def build_product_sheets(writer, triage_df, product_to_sheet, link_format):
-    """Generates filtered triage tabs exclusively for managed devices."""
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type', 'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index', 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
 
     for product, group in triage_df.groupby('Base Product'):
@@ -412,7 +345,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_format):
         group = group.sort_values(by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
         
         group.insert(0, 'Resolved', '☐')
-        group['NVD'] = group.apply(extract_nvd_link, axis=1)
+        group['NVD'] = vectorize_nvd_links(group)
         group['Vulnerability Name'] = group['Vulnerability Name'].apply(make_cve_org_link)
         
         final_cols = [c for c in cols_order if c in group.columns]
@@ -426,56 +359,96 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_format):
             ws_p.data_validation(1, res_idx, len(group), res_idx, {'validate': 'list', 'source': ['☐', '☑']})
             ws_p.set_column(res_idx, res_idx, 10) 
 
-        if 'Vulnerability Name' in final_cols:
-            ws_p.set_column(final_cols.index('Vulnerability Name'), final_cols.index('Vulnerability Name'), 25, link_format)
-        if 'NVD' in final_cols:
-            ws_p.set_column(final_cols.index('NVD'), final_cols.index('NVD'), 10, link_format)
-        if 'Name' in final_cols:
-            ws_p.set_column(final_cols.index('Name'), final_cols.index('Name'), 25)
-        if 'Device Type' in final_cols:
-            ws_p.set_column(final_cols.index('Device Type'), final_cols.index('Device Type'), 15)
+        if 'Vulnerability Name' in final_cols: ws_p.set_column(final_cols.index('Vulnerability Name'), final_cols.index('Vulnerability Name'), 25, link_format)
+        if 'NVD' in final_cols: ws_p.set_column(final_cols.index('NVD'), final_cols.index('NVD'), 10, link_format)
+        if 'Name' in final_cols: ws_p.set_column(final_cols.index('Name'), final_cols.index('Name'), 25)
+        if 'Device Type' in final_cols: ws_p.set_column(final_cols.index('Device Type'), final_cols.index('Device Type'), 15)
 
 def build_stale_excluded_sheet(writer, stale_excluded_df):
-    """Builds a tracking sheet for devices meeting the score threshold but excluded by the date filter."""
-    if stale_excluded_df.empty:
-        return
-        
+    if stale_excluded_df.empty: return
     export_df = stale_excluded_df[['Name', 'Last Response', 'Device Type']].drop_duplicates(subset=['Name']).copy()
     export_df = export_df.sort_values(by='Last Response')
     export_df.rename(columns={'Name': 'Device Name'}, inplace=True)
     
     sheet_name = 'Stale Excluded Devices'
     export_df.to_excel(writer, sheet_name=sheet_name, index=False)
-    
     ws = writer.sheets[sheet_name]
-    ws.set_column('A:A', 35)
-    ws.set_column('B:B', 25)
-    ws.set_column('C:C', 20)
+    ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 20)
     ws.autofilter(0, 0, len(export_df), len(export_df.columns) - 1)
 
 def build_raw_data_sheet(writer, raw_df):
-    """Dumps the completely unfiltered, pre-threshold dataset to a final tab for reference/auditing."""
-    raw_df_export = raw_df.copy()
-    
-    # Strip out the Python-specific helper columns we created during the merge so it looks clean
-    for col in ['Name_Join', 'Device_Join', 'Base Product', '_Sort_Time']:
-        if col in raw_df_export.columns: 
-            raw_df_export.drop(columns=[col], inplace=True)
-            
-    # Write to Excel
+    raw_df_export = raw_df.drop(columns=[c for c in ['Name_Join', 'Device_Join', 'Base Product', '_Sort_Time'] if c in raw_df.columns]).copy()
     raw_df_export.to_excel(writer, sheet_name='Raw Data', index=False)
-    
-    # Apply standard autofilter
-    ws_raw = writer.sheets['Raw Data']
-    ws_raw.autofilter(0, 0, len(raw_df_export), len(raw_df_export.columns) - 1)
-
+    writer.sheets['Raw Data'].autofilter(0, 0, len(raw_df_export), len(raw_df_export.columns) - 1)
 
 # ==========================================
-# --- ORCHESTRATOR / UI CONTROLLER ---
+# --- ORCHESTRATOR / THREADING ---
 # ==========================================
+
+def execute_processing_thread(vuln_path, rmm_path, skip_rmm, threshold_str, date_str, show_all_dates, progress):
+    """Refactored: Moves the heavy Pandas operations to a background thread to prevent UI freezing."""
+    try:
+        threshold = float(threshold_str)
+        
+        # Ask for the output file BEFORE heavy processing so the user isn't stuck waiting 
+        # just to find out they clicked cancel.
+        output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
+        if not output_file:
+            root.after(0, lambda: progress.stop())
+            root.after(0, lambda: progress.destroy())
+            return
+
+        df_vuln = load_vulnerability_data(vuln_path)
+        df_rmm = None if skip_rmm else load_rmm_data(rmm_path)
+        merged_df = merge_data(df_vuln, df_rmm, skip_rmm)
+
+        raw_df = merged_df.copy()
+        stale_excluded_df = pd.DataFrame()
+
+        if not show_all_dates:
+            cutoff_date = pd.to_datetime(date_str)
+            high_score_df = merged_df[merged_df['Vulnerability Score'] >= threshold]
+            stale_excluded_df = high_score_df[
+                (high_score_df['_Sort_Time'] < cutoff_date) & 
+                (high_score_df['Last Response'] != "Not Found in RMM")
+            ].copy()
+
+            merged_df = merged_df[
+                (merged_df['_Sort_Time'] >= cutoff_date) | 
+                (merged_df['Last Response'] == "Not Found in RMM")
+            ]
+
+        if merged_df.empty:
+            root.after(0, lambda: [progress.stop(), progress.destroy(), messagebox.showwarning("No Data", "No vulnerability records found.")])
+            return
+
+        filtered_for_sheets_df = merged_df[merged_df['Vulnerability Score'] >= threshold].copy()
+        triage_df = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] != "Not Found in RMM"].copy()
+        
+        used_sheet_names = set(['overview', 'all detections', 'raw data', 'stale excluded devices'])
+        product_to_sheet = {}
+        for product, _ in triage_df.groupby('Base Product'):
+            product_to_sheet[product] = clean_sheet_name(product, used_sheet_names)
+
+        with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
+            workbook = writer.book
+            link_format = workbook.add_format({'font_color': 'blue', 'underline': True})
+            header_format = workbook.add_format({'bold': True, 'font_size': 12, 'bg_color': '#D9D9D9', 'border': 1})
+            missing_row_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+
+            build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df, threshold, product_to_sheet, header_format, link_format)
+            build_all_detections_sheet(writer, merged_df, link_format, missing_row_format)
+            build_product_sheets(writer, triage_df, product_to_sheet, link_format)
+            
+            if not stale_excluded_df.empty: build_stale_excluded_sheet(writer, stale_excluded_df)
+            build_raw_data_sheet(writer, raw_df)
+
+        root.after(0, lambda: [progress.stop(), progress.destroy(), messagebox.showinfo("Success", f"Dashboard saved to:\n{output_file}")])
+        
+    except Exception as e:
+        root.after(0, lambda: [progress.stop(), progress.destroy(), messagebox.showerror("Error", f"Processing failed: {e}")])
 
 def process_reports():
-    """Main execution block: Coordinates data loading, filtering, and Excel export."""
     vuln_path = vuln_var.get()
     rmm_path = rmm_var.get()
     skip_rmm = skip_rmm_var.get()
@@ -490,102 +463,17 @@ def process_reports():
     progress = ttk.Progressbar(root, mode='indeterminate')
     progress.pack(pady=10)
     progress.start()
-    root.update()
-
-    try:
-        threshold = float(score_var.get())
-        
-        # 1. Pipeline: Load & Merge Data
-        df_vuln = load_vulnerability_data(vuln_path)
-        df_rmm = None if skip_rmm else load_rmm_data(rmm_path)
-        merged_df = merge_data(df_vuln, df_rmm, skip_rmm)
-
-        # Capture raw, totally unfiltered dataset before date or score filters apply
-        raw_df = merged_df.copy()
-
-        # Initialize an empty dataframe to safely hold excluded stale devices
-        stale_excluded_df = pd.DataFrame()
-
-        # 2. Filter by Calendar Date (if enabled)
-        if not show_all_dates_var.get():
-            try:
-                cutoff_date = pd.to_datetime(date_var.get())
-                
-                # --- NEW: Capture devices that meet the score but fail the date filter ---
-                # First, find records meeting the score threshold
-                high_score_df = merged_df[merged_df['Vulnerability Score'] >= threshold]
-                # Then, isolate the ones that are older than the cutoff AND actually exist in RMM
-                stale_excluded_df = high_score_df[
-                    (high_score_df['_Sort_Time'] < cutoff_date) & 
-                    (high_score_df['Last Response'] != "Not Found in RMM")
-                ].copy()
-
-                # Filter the main dataset
-                merged_df = merged_df[
-                    (merged_df['_Sort_Time'] >= cutoff_date) | 
-                    (merged_df['Last Response'] == "Not Found in RMM")
-                ]
-            except Exception as e:
-                progress.stop()
-                progress.destroy()
-                messagebox.showerror("Error", f"Invalid date format from calendar: {e}")
-                return
-
-        if merged_df.empty:
-            progress.stop()
-            progress.destroy()
-            messagebox.showwarning("No Data", "No vulnerability records found matching the specified date filter and thresholds.")
-            return
-
-        # 3. Get Output Destination
-        output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
-        if not output_file: 
-            progress.stop()
-            progress.destroy()
-            return 
-
-        # 4. Setup Excel Environment
-        filtered_for_sheets_df = merged_df[merged_df['Vulnerability Score'] >= threshold].copy()
-        triage_df = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] != "Not Found in RMM"].copy()
-        
-        used_sheet_names = set(['overview', 'all detections', 'raw data', 'stale excluded devices'])
-        product_to_sheet = {}
-        for product, _ in triage_df.groupby('Base Product'):
-            product_to_sheet[product] = clean_sheet_name(product, used_sheet_names)
-
-        # 5. Write Excel File
-        with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
-            workbook = writer.book
-            
-            link_format = workbook.add_format({'font_color': 'blue', 'underline': True})
-            header_format = workbook.add_format({'bold': True, 'font_size': 12, 'bg_color': '#D9D9D9', 'border': 1})
-            missing_row_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
-
-            build_overview_sheet(workbook, merged_df, filtered_for_sheets_df, triage_df, threshold, product_to_sheet, header_format, link_format)
-            build_all_detections_sheet(writer, merged_df, link_format, missing_row_format)
-            build_product_sheets(writer, triage_df, product_to_sheet, link_format)
-            
-            # --- NEW: Append Stale Excluded tracking sheet if data exists ---
-            if not stale_excluded_df.empty:
-                build_stale_excluded_sheet(writer, stale_excluded_df)
-                
-            build_raw_data_sheet(writer, raw_df)
-
-        progress.stop()
-        progress.destroy()
-        messagebox.showinfo("Success", f"Full Dashboard saved to:\n{output_file}")
-        
-    except Exception as e:
-        progress.stop()
-        progress.destroy()
-        messagebox.showerror("Error", f"Processing failed: {e}")
+    
+    # Spin up the background thread so the GUI doesn't freeze
+    threading.Thread(target=execute_processing_thread, args=(
+        vuln_path, rmm_path, skip_rmm, score_var.get(), date_var.get(), show_all_dates_var.get(), progress
+    ), daemon=True).start()
 
 # ==========================================
 # --- GUI SETUP ---
 # ==========================================
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
-# Set height to 520 to comfortably fit the calendar layout
 root.geometry("540x520")
 
 vuln_var = tk.StringVar()
@@ -607,7 +495,6 @@ tk.Checkbutton(root, text="Skip Device Report (Disables 'Last Response')", varia
 tk.Label(root, text="3. Score Threshold (Show in Tabs)", font=('Arial', 10, 'bold')).pack(pady=5)
 tk.Entry(root, textvariable=score_var, width=10).pack()
 
-# Calendar Filter Block
 tk.Label(root, text="4. RMM Check-in Cutoff Date", font=('Arial', 10, 'bold')).pack(pady=5)
 date_frame = tk.Frame(root)
 date_frame.pack()
@@ -619,13 +506,10 @@ cal = DateEntry(date_frame, selectmode='day', textvariable=date_var, date_patter
 cal.pack(side=tk.LEFT, padx=5)
 
 show_all_dates_checkbox = tk.Checkbutton(
-    date_frame,
-    text="Show All Dates",
-    variable=show_all_dates_var,
-    command=toggle_date_state
+    date_frame, text="Show All Dates", variable=show_all_dates_var, command=toggle_date_state
 )
 show_all_dates_checkbox.pack(side=tk.LEFT)
-toggle_date_state() # Initialize the default disabled state
+toggle_date_state() 
 
 tk.Button(root, text="GENERATE COMPLETE DASHBOARD", command=process_reports, bg="#0078D7", fg="white", font=('Arial', 10, 'bold'), height=2).pack(pady=20)
 root.mainloop()
