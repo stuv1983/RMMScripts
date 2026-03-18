@@ -491,6 +491,18 @@ try {
     $severity = 'Critical'
   }
 
+  # When managed AV (Bitdefender/N-able) is present, we expect BOTH it and Windows
+  # Defender to be enrolled in WSC. If WSC only shows 1 product, one of them has
+  # dropped out of the registry — flag it. This check does NOT apply to Defender-only
+  # endpoints, where a single WSC entry is the correct and expected state.
+  $wscCount = if ($products) { @($products).Count } else { 0 }
+  if ($IsManagedAVPresent -and $wscCount -lt 2) {
+    [void]$issues.Add((New-Issue -Severity 'Warning' -Code 'BELOW_AV_THRESHOLD' `
+      -Details "Only $wscCount AV product(s) registered in Windows Security Center (minimum expected: 2 when managed AV is deployed). WSC registered: $($products.DisplayName -join ', ')." `
+      -Recommendation 'Verify that both the managed AV (Bitdefender/N-able) and Windows Defender are correctly enrolled in WSC. Re-register or reinstall the missing product if needed.'))
+    if ($severity -ne 'Critical') { $severity = 'Warning' }
+  }
+
   # Detect unexpected third-party AV products (WSC inventory)
   # We allow Defender + BitDefender (N-able managed). Anything else is flagged.
   $unexpectedAV = @()
@@ -510,12 +522,42 @@ try {
   # ---------------------------------------------------------------------------
   # Managed AV guardrail
   # ---------------------------------------------------------------------------
-  # If managed AV is present, we do NOT evaluate Defender signature age / Defender RT
-  # status as they are often intentionally disabled by third-party AV.
+  # If managed AV is present, skip Defender RT/signature checks (those being off/stale
+  # is expected when a third-party AV owns protection). However, scan age checks and
+  # the managed AV's own RT state are still evaluated — a 180-day-old scan is a real
+  # problem regardless of which product is managing protection.
   if ($IsManagedAVPresent) {
     [void]$issues.Add((New-Issue -Severity 'Info' -Code 'MANAGED_AV_PRESENT' `
-      -Details ("Managed AV detected via WSC: {0}. Skipping Defender posture checks by design." -f ($managedProducts.DisplayName -join ', ')) `
+      -Details ("Managed AV detected via WSC: {0}. Skipping Defender RT/signature checks by design." -f ($managedProducts.DisplayName -join ', ')) `
       -Recommendation 'No action required. Ensure Bitdefender policies are applied and up to date.'))
+
+    # Validate the managed AV product itself has real-time protection on.
+    # If the managed AV's own RT is off, that is a genuine gap — nothing is protecting the endpoint.
+    $managedRTOff = @($managedProducts | Where-Object { -not $_.RealTimeEnabled })
+    if ($managedRTOff.Count -gt 0) {
+      $names = ($managedRTOff.DisplayName -join ', ')
+      [void]$issues.Add((New-Issue -Severity 'Critical' -Code 'MANAGED_AV_REALTIME_OFF' `
+        -Details "Managed AV real-time protection is reported as OFF for: $names. No AV product has active real-time protection." `
+        -Recommendation 'Check Bitdefender/N-able policy assignment and agent health. Re-push policy or reinstall the agent if needed.'))
+      $severity = 'Critical'
+    }
+
+    # Defender scan age is still meaningful even in passive mode — Windows schedules
+    # periodic scans for Defender regardless of which AV owns real-time protection.
+    # A severely stale scan timestamp indicates scheduled tasks may have broken.
+    if ($def.Present) {
+      if ($null -ne $def.QuickScanAgeDays -and $def.QuickScanAgeDays -gt $QuickScanThresholdDays) {
+        [void]$issues.Add((New-Issue -Severity 'Warning' -Code 'DEF_QUICKSCAN_STALE' `
+          -Details "Last Defender quick scan was $($def.QuickScanAgeDays) days ago (threshold: $QuickScanThresholdDays days). Defender is present and should still run periodic scans even in passive mode." `
+          -Recommendation 'Trigger a Defender quick scan manually or verify that Windows scheduled scan tasks are enabled and not broken.'))
+        if ($severity -ne 'Critical') { $severity = 'Warning' }
+      } elseif ($null -eq $def.QuickScanAgeDays) {
+        [void]$issues.Add((New-Issue -Severity 'Warning' -Code 'DEF_QUICKSCAN_NEVER' `
+          -Details 'No Defender quick scan timestamp found; Defender may never have scanned this endpoint.' `
+          -Recommendation 'Trigger a Defender quick scan and confirm scheduled scan tasks are enabled.'))
+        if ($severity -ne 'Critical') { $severity = 'Warning' }
+      }
+    }
   }
   else {
     # Defender checks (only if Defender present)
