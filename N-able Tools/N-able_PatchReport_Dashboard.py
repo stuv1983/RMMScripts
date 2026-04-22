@@ -5,17 +5,16 @@ cve_patch_match_v4.py
 Matches a Patch Report (CSV or Excel) against a CVE detections workbook.
 
 What changed from v3:
-- Added automatic KB extraction from matched patch text (no KB option in GUI/CLI)
+- Added automatic KB extraction from matched patch text
 - Added version extraction from matched patch text
 - Added fixed-version checking layer
-- Added version-aware output columns and summary
+- Default minimum CVE score is 9.0
+- Simplified resolved status to Resolved / Unresolved
 
 Notes:
 - Fixed-version validation uses, in order:
     1. A "Fixed Version" column in the CVE workbook, if present
     2. BUILTIN_FIXED_VERSION_RULES below, if populated for a product/CVE
-- If no fixed version is available, the script still performs patch evidence matching
-  and marks the result as "Likely" rather than claiming confirmed remediation.
 """
 
 import re
@@ -82,14 +81,14 @@ PRODUCT_LABELS = {
 }
 
 # Optional built-in fixed version baselines.
-# Structure:
-# {
-#   "chrome": {
-#       "CVE-2026-12345": "136.0.7103.114",
-#   },
-#   "firefox": {
-#       "CVE-2026-5678": "147.0.2",
-#   },
+# Example:
+# BUILTIN_FIXED_VERSION_RULES = {
+#     "chrome": {
+#         "CVE-2026-12345": "136.0.7103.114",
+#     },
+#     "firefox": {
+#         "CVE-2026-5678": "147.0.2",
+#     },
 # }
 BUILTIN_FIXED_VERSION_RULES = {
 }
@@ -119,7 +118,10 @@ def extract_best_version(text):
     versions = extract_versions(text)
     if not versions:
         return ""
-    versions = sorted(versions, key=lambda v: (len(v.split(".")), [int(x) for x in v.split(".")]))
+    versions = sorted(
+        versions,
+        key=lambda v: (len(v.split(".")), [int(x) for x in v.split(".")])
+    )
     return versions[-1]
 
 
@@ -155,8 +157,12 @@ def make_excel_safe(df):
 
 
 _STATUS_RANK = {
-    "Installed": 6, "Reboot Required": 5, "Installing": 4,
-    "Pending": 3,   "Missing": 2,         "Failed": 1,
+    "Installed": 6,
+    "Reboot Required": 5,
+    "Installing": 4,
+    "Pending": 3,
+    "Missing": 2,
+    "Failed": 1,
 }
 
 _STATUS_LABEL = {
@@ -245,21 +251,9 @@ def classify_version_check(row):
 
 def classify_resolution(row):
     patch_status = str(row.get("Status", "")).strip()
-    version_result = str(row.get("Version Check Result", "")).strip()
-
-    if patch_status not in _INSTALLED_STATUSES:
-        return "No"
-
-    if version_result == "Version compliant":
-        return "Yes"
-
-    if version_result in {"Installed version found - no fixed baseline", "Installed - version unknown"}:
-        return "Likely"
-
-    if version_result == "Fixed baseline known - installed version not found":
-        return "Likely"
-
-    return "No"
+    if patch_status in _INSTALLED_STATUSES:
+        return "Resolved"
+    return "Unresolved"
 
 
 # ── Core processing ──────────────────────────────────────────────────────────
@@ -269,7 +263,7 @@ def process_files(
     cve_path,
     out_path,
     date_from=None,
-    min_score=None,
+    min_score=9.0,
 ):
     """
     Returns (total_rows, filtered_rows, csv_path).
@@ -286,8 +280,8 @@ def process_files(
     )
     cve = xl.parse(target)
 
-    miss_p = {"Client","Site","Device","Status","Patch","Discovered / Install Date"} - set(patch.columns)
-    miss_c = {"Vulnerability Name","Name","Affected Products","Customer","Site"} - set(cve.columns)
+    miss_p = {"Client", "Site", "Device", "Status", "Patch", "Discovered / Install Date"} - set(patch.columns)
+    miss_c = {"Vulnerability Name", "Name", "Affected Products", "Customer", "Site"} - set(cve.columns)
     if miss_p:
         raise ValueError(f"Patch report missing: {', '.join(sorted(miss_p))}")
     if miss_c:
@@ -296,8 +290,10 @@ def process_files(
     total_rows = len(cve)
 
     cve = cve.copy()
-    if min_score is not None and "Vulnerability Score" in cve.columns:
-        cve = cve[pd.to_numeric(cve["Vulnerability Score"], errors="coerce").fillna(0) >= min_score]
+    if "Vulnerability Score" in cve.columns:
+        cve = cve[
+            pd.to_numeric(cve["Vulnerability Score"], errors="coerce").fillna(0) >= min_score
+        ]
 
     if date_from is not None and "Last Response" in cve.columns:
         parsed = parse_last_response(cve["Last Response"])
@@ -333,20 +329,21 @@ def process_files(
             )
 
     merged = cve.merge(
-        patch[["_ck","_sk","_dk","_pk","Status","Patch","_pd","_sr","_kbs","_pv"]].rename(columns={"_ck":"_mck"}),
-        left_on=["_ck","_sk","_dk","_pk"],
-        right_on=["_mck","_sk","_dk","_pk"],
-        how="left", suffixes=("","_p"),
+        patch[["_ck", "_sk", "_dk", "_pk", "Status", "Patch", "_pd", "_sr", "_kbs", "_pv"]].rename(columns={"_ck": "_mck"}),
+        left_on=["_ck", "_sk", "_dk", "_pk"],
+        right_on=["_mck", "_sk", "_dk", "_pk"],
+        how="left",
+        suffixes=("", "_p"),
     )
-    merged = merged.sort_values(["_sr","_pd"], ascending=[False,False], na_position="last")
+    merged = merged.sort_values(["_sr", "_pd"], ascending=[False, False], na_position="last")
     gcols = [c for c in cve.columns if not c.startswith("_")]
     best = merged.groupby(gcols, dropna=False, as_index=False).first()
 
     def classify_patch_match(row):
         if not pd.isna(row.get("Patch")):
             return _STATUS_LABEL.get(
-                str(row.get("Status","")).strip(),
-                f"Matched - {str(row.get('Status','')).lower()}"
+                str(row.get("Status", "")).strip(),
+                f"Matched - {str(row.get('Status', '')).lower()}"
             )
         key = (row["_ck"], row["_sk"], row["_dk"])
         if key in patch_devices:
@@ -364,26 +361,10 @@ def process_files(
     best["Version Check Result"] = best.apply(classify_version_check, axis=1)
     best["Resolved (from Patch Report)"] = best.apply(classify_resolution, axis=1)
 
-    best = best.rename(columns={"Patch":"Matched Patch","_pd":"Patch Install Date"})
+    best = best.rename(columns={"Patch": "Matched Patch", "_pd": "Patch Install Date"})
     best = best.drop(columns=[c for c in best.columns if c.startswith("_")], errors="ignore")
 
-    summary = (
-        best.groupby(["Affected Products","Patch Match Result","Version Check Result"], dropna=False)
-        .size().reset_index(name="Count")
-        .sort_values(["Affected Products","Count"], ascending=[True,False])
-    )
-
-    meta = pd.DataFrame([
-        {"Parameter": "Last Response from",       "Value": str(date_from) if date_from else "— (no filter)"},
-        {"Parameter": "Min Vulnerability Score",  "Value": str(min_score) if min_score is not None else "— (no filter)"},
-        {"Parameter": "CVE rows (before filter)", "Value": total_rows},
-        {"Parameter": "CVE rows (after filter)",  "Value": filtered_rows},
-        {"Parameter": "KB extraction",            "Value": "Automatic from matched patch text"},
-        {"Parameter": "Fixed version rules",      "Value": "Uses CVE workbook 'Fixed Version' column first, then built-in rules"},
-    ])
-
-    slim_cols = [
-        "Vulnerability Name",
+    overview_cols = [
         "Name",
         "Device Type",
         "Threat Status",
@@ -394,24 +375,17 @@ def process_files(
         "Last updated",
         "Last Response",
         "Matched Patch",
-        "Matched Patch Version",
-        "Matched KBs",
-        "Fixed Version Used",
-        "Fixed Version Source",
         "Patch Install Date",
         "Patch Match Result",
-        "Version Check Result",
         "Resolved (from Patch Report)",
     ]
-    slim_cols_present = [c for c in slim_cols if c in best.columns]
-    slim = make_excel_safe(best[slim_cols_present])
+    overview_cols_present = [c for c in overview_cols if c in best.columns]
+    overview = make_excel_safe(best[overview_cols_present])
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        slim.to_excel(writer, sheet_name="CVE Marked", index=False)
+        overview.to_excel(writer, sheet_name="Overview", index=False)
         make_excel_safe(best).to_excel(writer, sheet_name="Full Data", index=False)
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        meta.to_excel(writer, sheet_name="Filter Info", index=False)
-        make_excel_safe(patch).to_excel(writer, sheet_name="Patch Source", index=False)
+        make_excel_safe(patch).to_excel(writer, sheet_name="Patch Report (Full)", index=False)
 
     csv_out = str(Path(out_path).with_suffix(".csv"))
     best.to_csv(csv_out, index=False)
@@ -438,8 +412,8 @@ def _build_calendar_popup(parent, initial_date=None, callback=None):
     header.pack(fill="x")
 
     lbl_month = ttk.Label(header, width=16, anchor="center", font=("", 10, "bold"))
-    btn_prev  = ttk.Button(header, text="◀", width=3)
-    btn_next  = ttk.Button(header, text="▶", width=3)
+    btn_prev = ttk.Button(header, text="◀", width=3)
+    btn_next = ttk.Button(header, text="▶", width=3)
 
     btn_prev.pack(side="left")
     lbl_month.pack(side="left", expand=True)
@@ -447,7 +421,7 @@ def _build_calendar_popup(parent, initial_date=None, callback=None):
 
     day_frame = ttk.Frame(popup, padding=(4, 0))
     day_frame.pack()
-    for i, d in enumerate(["Mo","Tu","We","Th","Fr","Sa","Su"]):
+    for i, d in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
         ttk.Label(day_frame, text=d, width=4, anchor="center", foreground="#555").grid(row=0, column=i)
 
     grid_frame = ttk.Frame(popup, padding=(4, 2, 4, 8))
@@ -457,8 +431,12 @@ def _build_calendar_popup(parent, initial_date=None, callback=None):
         row_btns = []
         for c in range(7):
             b = tk.Button(
-                grid_frame, width=3, relief="flat", font=("", 9),
-                activebackground="#4a90d9", activeforeground="white"
+                grid_frame,
+                width=3,
+                relief="flat",
+                font=("", 9),
+                activebackground="#4a90d9",
+                activeforeground="white",
             )
             b.grid(row=r, column=c, padx=1, pady=1)
             row_btns.append(b)
@@ -489,7 +467,13 @@ def _build_calendar_popup(parent, initial_date=None, callback=None):
                     callback(chosen)
                 popup.destroy()
 
-            day_btns[row][wd].config(text=str(day_n), state="normal", bg=bg, fg=fg, command=on_click)
+            day_btns[row][wd].config(
+                text=str(day_n),
+                state="normal",
+                bg=bg,
+                fg=fg,
+                command=on_click,
+            )
 
     def prev_month():
         if state["month"] == 1:
@@ -534,7 +518,7 @@ def _run_gui():
             self.cve_var = tk.StringVar()
             self.out_var = tk.StringVar()
             self.date_from_var = tk.StringVar()
-            self.min_score_var = tk.StringVar()
+            self.min_score_var = tk.StringVar(value="9.0")
 
             frame = ttk.Frame(root, padding=16)
             frame.pack(fill="both", expand=True)
@@ -552,14 +536,14 @@ def _run_gui():
 
             ttk.Separator(frame, orient="horizontal").grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 6))
 
-            ttk.Label(frame, text="Filters  (leave blank for no filter)", font=("", 9, "bold")).grid(
+            ttk.Label(frame, text="Filters", font=("", 9, "bold")).grid(
                 row=4, column=0, columnspan=4, sticky="w", pady=(0, 6)
             )
 
             date_row = ttk.Frame(frame)
             date_row.grid(row=5, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
-            ttk.Label(date_row, text="Last Response  from").pack(side="left", padx=(0, 6))
+            ttk.Label(date_row, text="Last Response from").pack(side="left", padx=(0, 6))
             self._date_entry = ttk.Entry(date_row, textvariable=self.date_from_var, width=13)
             self._date_entry.pack(side="left")
             ttk.Label(date_row, text="DD/MM/YYYY", foreground="grey").pack(side="left", padx=(4, 10))
@@ -569,9 +553,9 @@ def _run_gui():
             score_row = ttk.Frame(frame)
             score_row.grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 6))
 
-            ttk.Label(score_row, text="Min Vulnerability Score  ≥").pack(side="left", padx=(0, 6))
+            ttk.Label(score_row, text="Min Vulnerability Score ≥").pack(side="left", padx=(0, 6))
             ttk.Entry(score_row, textvariable=self.min_score_var, width=8).pack(side="left")
-            ttk.Label(score_row, text="e.g. 9.0   (leave blank for all)", foreground="grey").pack(side="left", padx=(8, 0))
+            ttk.Label(score_row, text="default 9.0", foreground="grey").pack(side="left", padx=(8, 0))
 
             ttk.Separator(frame, orient="horizontal").grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 6))
 
@@ -598,17 +582,17 @@ def _run_gui():
             root.minsize(700, root.winfo_reqheight())
 
         def _pick_patch(self):
-            v = filedialog.askopenfilename(filetypes=[("CSV / Excel","*.csv *.xlsx *.xls"), ("All files","*.*")])
+            v = filedialog.askopenfilename(filetypes=[("CSV / Excel", "*.csv *.xlsx *.xls"), ("All files", "*.*")])
             if v:
                 self.patch_var.set(v)
 
         def _pick_cve(self):
-            v = filedialog.askopenfilename(filetypes=[("Excel","*.xlsx *.xls"), ("All files","*.*")])
+            v = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")])
             if v:
                 self.cve_var.set(v)
 
         def _pick_out(self):
-            v = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Workbook","*.xlsx")])
+            v = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Workbook", "*.xlsx")])
             if v:
                 self.out_var.set(v)
 
@@ -630,7 +614,7 @@ def _run_gui():
             self.log.delete("1.0", "end")
             try:
                 date_from = None
-                min_score = None
+                min_score = 9.0
 
                 raw_date = self.date_from_var.get().strip()
                 if raw_date:
@@ -645,14 +629,17 @@ def _run_gui():
 
                 self._log("Filters:")
                 self._log(f"  Last Response from : {date_from or '—'}")
-                self._log(f"  Min Score          : {min_score or '—'}")
+                self._log(f"  Min Score          : {min_score}")
                 self._log("  KB extraction      : automatic")
                 self._log("")
 
                 self._log("Processing…")
                 total, filtered, csv_out = process_files(
-                    self.patch_var.get(), self.cve_var.get(), self.out_var.get(),
-                    date_from=date_from, min_score=min_score,
+                    self.patch_var.get(),
+                    self.cve_var.get(),
+                    self.out_var.get(),
+                    date_from=date_from,
+                    min_score=min_score,
                 )
                 self._log(f"CVE rows before filter : {total}")
                 self._log(f"CVE rows after  filter : {filtered}")
@@ -684,15 +671,18 @@ def main():
     parser.add_argument("--patch")
     parser.add_argument("--cve")
     parser.add_argument("--out")
-    parser.add_argument("--date-from", help="Last Response >= date  (DD/MM/YYYY)")
-    parser.add_argument("--min-score", type=float)
+    parser.add_argument("--date-from", help="Last Response >= date (DD/MM/YYYY)")
+    parser.add_argument("--min-score", type=float, default=9.0)
     args = parser.parse_args()
 
     if args.patch and args.cve and args.out:
         date_from = parse_input_date(args.date_from) if args.date_from else None
         total, filtered, csv_out = process_files(
-            args.patch, args.cve, args.out,
-            date_from=date_from, min_score=args.min_score,
+            args.patch,
+            args.cve,
+            args.out,
+            date_from=date_from,
+            min_score=args.min_score,
         )
         print(f"CVE rows before filter : {total}")
         print(f"CVE rows after  filter : {filtered}")
