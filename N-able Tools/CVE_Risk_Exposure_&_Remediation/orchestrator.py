@@ -32,7 +32,7 @@ from excel_builder import (
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
-    build_patch_failure_sheet,
+    build_patch_failure_sheet, build_not_in_patch_scope_sheet,
 )
 
 log = logging.getLogger(__name__)
@@ -277,6 +277,9 @@ def run(request: DashboardRequest) -> DashboardResult:
             except Exception as exc:
                 log.warning("Could not compute re-detected count: %s", exc)
 
+        # Initialise failure_df before workbook write block so all branches can reference it
+        failure_df = None
+
         # ── Write workbook ────────────────────────────────────────────────────
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:
@@ -325,8 +328,23 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if patch_data:
                 build_patch_sheets(writer, patch_data[0], patch_data[1], patch_data[2])
-                if any(not diagnostics[k].empty for k in diagnostics):
+                if any(not diagnostics[k].empty for k in diagnostics
+                       if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
+
+                # Devices in CVE data but absent from patch report entirely
+                patch_report_devices = set(
+                    patch_data[1]['Name'].apply(normalize_device_name).unique()
+                ) if patch_data else set()
+                failure_report_devices = set(
+                    failure_df['_device_norm'].unique()
+                ) if failure_df is not None else set()
+
+                build_not_in_patch_scope_sheet(
+                    writer, triage_df,
+                    patch_devices=patch_report_devices,
+                    failure_devices=failure_report_devices,
+                )
 
             # ── Optional: patch failure report ────────────────────────────────
             if request.include_failure_report and request.failure_report_path:
