@@ -18,7 +18,6 @@ from typing import Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from tkcalendar import DateEntry
 
 from orchestrator import DashboardRequest, DashboardResult, run as run_dashboard
 
@@ -217,8 +216,9 @@ date_var = tk.StringVar()
 from datetime import date, timedelta
 _default_since = (date.today() - timedelta(days=90)).strftime('%Y-%m-%d')
 date_var.set(_default_since)
-date_entry = DateEntry(date_frame, textvariable=date_var, date_pattern="yyyy-mm-dd", width=12)
+date_entry = tk.Entry(date_frame, textvariable=date_var, width=12)
 date_entry.pack(side=tk.LEFT, padx=6)
+tk.Label(date_frame, text="(yyyy-mm-dd)").pack(side=tk.LEFT, padx=4)
 show_all_dates_var = tk.BooleanVar()
 tk.Checkbutton(date_frame, text="Show All Dates",
                variable=show_all_dates_var, command=toggle_date_state).pack(side=tk.LEFT)
