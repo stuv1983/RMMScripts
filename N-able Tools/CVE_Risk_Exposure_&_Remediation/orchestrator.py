@@ -42,15 +42,20 @@ log = logging.getLogger(__name__)
 def _try_sync_baselines() -> None:
     """
     Silently attempt to refresh _baseline values in config.json from vendor APIs.
-    Logs results but never raises — a sync failure must not block the dashboard run.
+    Updates FIXED_VERSION_RULES in-place so this run uses the fresh baselines.
+    Never raises — a sync failure must not block the dashboard run.
     """
     try:
         from version_sync import sync_baselines
         updated = sync_baselines()
         if updated:
-            # Reload FIXED_VERSION_RULES so this run uses the fresh baselines
-            import importlib, config as _cfg_mod
-            importlib.reload(_cfg_mod)
+            import json as _json
+            _fresh = _json.load(open(
+                __file__.replace('orchestrator.py', 'config.json'),
+                encoding='utf-8'
+            )).get('fixed_version_rules', {})
+            FIXED_VERSION_RULES.clear()
+            FIXED_VERSION_RULES.update(_fresh)
             log.info("Baselines refreshed: %s",
                      ', '.join(f'{k}={v}' for k, v in updated.items()))
         else:
@@ -115,6 +120,26 @@ def run(request: DashboardRequest) -> DashboardResult:
         log.info("Loading vulnerability data: %s", request.vuln_path)
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
+
+        # Auto-enrich fixed_version_rules for any CVE not yet in config.json.
+        # config.json is the persistent cache — each CVE is only looked up once.
+        # After the first run its version data is saved and reused every time.
+        try:
+            from cve_lookup import enrich_from_detections
+            enriched = enrich_from_detections(df_vuln)
+            if enriched:
+                # Update FIXED_VERSION_RULES in-place so this run uses the
+                # freshly added version data — no module reload needed
+                import json as _json
+                _fresh = _json.load(open(
+                    __file__.replace('orchestrator.py', 'config.json'),
+                    encoding='utf-8'
+                )).get('fixed_version_rules', {})
+                FIXED_VERSION_RULES.clear()
+                FIXED_VERSION_RULES.update(_fresh)
+                log.info("CVE lookup: %d CVE(s) enriched and version rules updated", enriched)
+        except Exception as _e:
+            log.debug("CVE lookup auto-enrich skipped: %s", _e)
 
         df_rmm = None
         if not request.skip_rmm and request.rmm_path:
