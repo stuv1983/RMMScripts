@@ -258,25 +258,51 @@ def _classify_version_check(row):
 
 def _classify_resolution(row):
     """
-    A patch is 'Resolved' only when:
-      1. Status is Installed or Reboot Required, AND
-      2. Patch Install Date is AFTER both Date Published and First detected
-         (confirms the patch was applied after the vulnerability was known/active).
-    If no CVE date is available for comparison, status alone is sufficient.
+    A patch is 'Resolved' when we can PROVE the device is protected:
+
+    Path 1 — Version confirmed compliant:
+      Status is Installed/Reboot Required AND version >= fixed baseline.
+      Timing doesn't matter here — if the version proves the fix, the device
+      is protected regardless of when it was installed.
+
+    Path 2 — Version not verifiable, rely on timing:
+      Status is Installed AND install date > First detected AND we have a
+      fixed baseline. This confirms the patch was applied in response to the CVE.
+
+    Returns Unresolved when:
+      - Not installed (Pending/Missing/Failed)
+      - Installed but no fixed baseline to compare (can't prove anything)
+      - Installed but version is below fixed (wrong version)
+      - Installed but install predates detection AND no version check passes
     """
-    if str(row.get('Status', '')).strip() not in INSTALLED_STATUSES:
+    status = str(row.get('Status', '')).strip()
+    if status not in INSTALLED_STATUSES:
         return 'Unresolved'
 
+    vcr = str(row.get('Version Check Result', '')).strip().lower()
+
+    # Path 1: Version is confirmed compliant — Resolved regardless of timing
+    if 'version compliant' in vcr:
+        return 'Resolved'
+
+    # Version explicitly below fixed — never resolve
+    if 'below fixed version' in vcr:
+        return 'Unresolved'
+
+    # No fixed baseline — can't confirm this version addresses the CVE
+    if 'no fixed baseline' in vcr:
+        return 'Unresolved'
+
+    # Path 2: Version not conclusive, fall back to timing check
     install_date = row.get('Patch Install Date')
     if pd.isna(install_date) if hasattr(install_date, '__class__') else not install_date:
-        return 'Unresolved'  # Installed status but no recorded install date
+        return 'Unresolved'
 
     try:
         install_dt = pd.to_datetime(install_date, errors='coerce')
         if pd.isna(install_dt):
             return 'Unresolved'
 
-        # Collect CVE reference dates — patch must post-date ALL of these
         cve_dates = []
         for col in ('Date Published', 'First detected'):
             v = row.get(col)
@@ -286,14 +312,19 @@ def _classify_resolution(row):
                     cve_dates.append(dt)
 
         if not cve_dates:
-            return 'Resolved'   # No reference dates — trust the installed status
+            return 'Unresolved'
 
-        # Patch must be installed on or after the latest CVE reference date
-        if install_dt >= max(cve_dates):
-            return 'Resolved'
-        return 'Unresolved'     # Patch predates CVE detection — not confirmed resolved
+        # Explicit version check with fixed version
+        fv = str(row.get('Fixed Version Used', '')).strip()
+        pv = str(row.get('Matched Patch Version', '')).strip()
+        if fv and pv:
+            cmp = _version_gte(pv, fv)
+            if cmp is True and install_dt >= max(cve_dates):
+                return 'Resolved'
+
+        return 'Unresolved'
     except Exception:
-        return 'Resolved'       # Fallback: date parse failed, trust installed status
+        return 'Unresolved'
 
 
 # ==============================================================================
@@ -565,9 +596,19 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Step 1: build best installed version per (device, product_key)
+    # CRITICAL: only use rows where Status is Installed or Reboot Required.
+    # Pending/Missing/Installing rows have a Matched Patch Version (from the
+    # patch name) but the patch is NOT actually on the device yet.
+    # The "Discovered / Install Date" for Pending is the discovery date, not install.
     df['_cascade_pk'] = df.get('_pk', df['Affected Products'].apply(
         lambda v: _detect_product(str(v).lower())))
-    has_ver = df[df['Matched Patch Version'].astype(str).str.strip().str.len() > 2].copy()
+
+    # Filter to installed rows first, then check version
+    installed_mask = df['Patch Match Result'].astype(str).str.strip().isin(
+        {'Matched - installed', 'Matched - reboot required'}
+    )
+    has_ver = df[installed_mask & 
+                 (df['Matched Patch Version'].astype(str).str.strip().str.len() > 2)].copy()
     has_ver['_vt'] = has_ver['Matched Patch Version'].apply(_parse_version)
     has_ver = has_ver[has_ver['_vt'].notna()]
     if has_ver.empty:
@@ -623,6 +664,9 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # Step 3: apply to Unresolved rows that match (device, product_key, cve_id)
+    # Two paths to cascade resolve:
+    #   A) Explicit CVE rule + version compliant → always resolve (timing irrelevant)
+    #   B) Baseline sentinel + version compliant + install post-dates detection
     cascade_applied = 0
     for idx, row in df.iterrows():
         if str(row.get('Resolved (from Patch Report)', '')).strip() != 'Unresolved':
@@ -631,22 +675,27 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         pk      = str(row.get('_cascade_pk', ''))
         cve_ids = [c.upper() for c in _extract_cves(str(row.get('Vulnerability Name', '')))]
 
-        # Date check: known install date must post-date first_detected for this row
         key = (device, pk)
         if key not in best_ver:
             continue
-        install_dt = pd.to_datetime(best_ver[key]['install_date'], errors='coerce')
+
+        ver_info   = best_ver[key]
+        install_dt = pd.to_datetime(ver_info['install_date'], errors='coerce')
         first_dt   = pd.to_datetime(row.get('First detected', pd.NaT), errors='coerce')
-        if pd.isna(install_dt) or pd.isna(first_dt) or install_dt < first_dt:
-            continue
 
         for cve_id in cve_ids:
-            # Match explicit CVE rule OR baseline sentinel
-            if (device, pk, cve_id) in cascade_resolve or \
-               (device, pk, '_BASELINE_') in cascade_resolve:
+            if (device, pk, cve_id) in cascade_resolve:
+                # Explicit CVE rule matched + version compliant → resolve
+                # Version already confirmed >= fixed in Step 2
                 df.at[idx, 'Resolved (from Patch Report)'] = 'Resolved'
                 cascade_applied += 1
                 break
+            elif (device, pk, '_BASELINE_') in cascade_resolve:
+                # Baseline: also need timing check (we don't know the per-CVE threshold)
+                if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
+                    df.at[idx, 'Resolved (from Patch Report)'] = 'Resolved'
+                    cascade_applied += 1
+                    break
 
     if cascade_applied:
         log.info("Cascade resolution: %d additional rows resolved via version compliance",
