@@ -76,6 +76,8 @@ from data_pipeline import (
     _classify_version_check,
     _classify_resolution,
     _resolve_fixed_version,
+    _resolve_baseline,
+    _classify_baseline_compliance,
     FIXED_VERSION_RULES,
 )
 
@@ -115,10 +117,12 @@ def _make_row(
 
 class TestResolveFixedVersion:
 
-    def test_baseline_supersedes_stale_per_cve_rule(self):
+    def test_resolve_fixed_version_returns_cve_specific_only(self):
         """
-        Edge CVE-2026-5289: per-CVE rule is 146.0.3856.97, baseline is 147.0.3912.87.
-        The baseline is stricter and must win.
+        _resolve_fixed_version returns the CVE-specific rule only — not the baseline.
+        Edge CVE-2026-5289 fixed at 146.0.3856.97; baseline is 147.0.3912.87.
+        The function should return 146.0.3856.97 (CVE rule), NOT 147.0.3912.87 (baseline).
+        Baseline compliance is tracked separately in _resolve_baseline.
         """
         row = _make_row(
             status='Installed', matched_version='146.0.3856.78',
@@ -127,8 +131,64 @@ class TestResolveFixedVersion:
             pk='edge',
         )
         fv, source = _resolve_fixed_version(row)
-        assert fv == '147.0.3912.87', f"Expected baseline 147.0.3912.87, got {fv}"
-        assert 'supersedes' in source.lower() or 'baseline' in source.lower()
+        assert fv == '146.0.3856.97', (
+            f"Expected per-CVE rule 146.0.3856.97, got {fv!r}. "
+            f"_resolve_fixed_version must return CVE-specific rule, not baseline."
+        )
+        assert 'config rule' in source.lower()
+
+    def test_resolve_baseline_returns_rolling_baseline(self):
+        """
+        _resolve_baseline returns the _baseline entry independently of any CVE rule.
+        This is how 'Baseline Compliance' is computed separately from CVE patch status.
+        """
+        from data_pipeline import _resolve_baseline
+        import data_pipeline as _dp
+        _dp.FIXED_VERSION_RULES.setdefault('edge', {})
+        _dp.FIXED_VERSION_RULES['edge']['_baseline'] = '147.0.3912.87'
+        row = _make_row(
+            status='Installed', matched_version='146.0.3856.78',
+            fixed_version='', install_date='2026-03-30', first_detected='2026-04-04',
+            vulnerability_name='CVE-2026-5289', affected_products='Microsoft Edge 80+',
+            pk='edge',
+        )
+        bl, bl_src = _resolve_baseline(row)
+        assert bl == '147.0.3912.87', f"Expected baseline 147.0.3912.87, got {bl!r}"
+        assert 'baseline' in bl_src.lower()
+
+    def test_cve_compliant_but_below_baseline_shows_both(self):
+        """
+        Core separation test: Chrome 147.0.7727.117 is:
+          - CVE-compliant for CVE-2026-5858 (fixed at 147.0.7727.55)  → Patch confirmed
+          - Below current baseline (148.0.7778.97)                     → Below baseline
+
+        Both must be independently reportable without one overriding the other.
+        """
+        from data_pipeline import _classify_baseline_compliance
+        import data_pipeline as _dp
+        _dp.FIXED_VERSION_RULES.setdefault('chrome', {})
+        _dp.FIXED_VERSION_RULES['chrome']['_baseline'] = '148.0.7778.97'
+        _dp.FIXED_VERSION_RULES['chrome']['CVE-2026-5858'] = '147.0.7727.55'
+
+        row = _make_row(
+            status='Installed', matched_version='147.0.7727.117',
+            fixed_version='147.0.7727.55', install_date='2026-04-29',
+            first_detected='2026-04-11', pk='chrome',
+        )
+        row['Version Check Result'] = 'Version compliant'
+        row['Product Baseline'] = '148.0.7778.97'
+
+        # CVE resolution: version compliant + install post-dates detection → Patch confirmed
+        cve_result = _classify_resolution(row)
+        assert cve_result == 'Patch confirmed - pending rescan', (
+            f"147.117 >= 147.55 + install after detection → should be Patch confirmed, got {cve_result!r}"
+        )
+
+        # Baseline: 147.117 < 148.97 → Below baseline
+        bl_result = _classify_baseline_compliance(row)
+        assert bl_result == 'Below baseline', (
+            f"147.117 < 148.97 → should be Below baseline, got {bl_result!r}"
+        )
 
     def test_per_cve_wins_when_stricter_than_baseline(self):
         """
@@ -154,16 +214,32 @@ class TestResolveFixedVersion:
             del _dp.FIXED_VERSION_RULES['chrome']['CVE-9999-99999']
             _dp.FIXED_VERSION_RULES['chrome']['_baseline'] = old_baseline
 
-    def test_baseline_only_when_no_per_cve_rule(self):
-        """When there is no per-CVE rule, the baseline is returned."""
+    def test_no_per_cve_rule_returns_empty_from_resolve_fixed_version(self):
+        """
+        When there is no per-CVE rule, _resolve_fixed_version returns empty.
+        The baseline is NOT returned here — it is a separate concern in _resolve_baseline.
+        """
         row = _make_row(
             status='Installed', matched_version='147.0.7727.117',
             fixed_version='', install_date='2026-04-29', first_detected='2026-04-11',
             vulnerability_name='CVE-2026-NOPERRULE', pk='chrome',
         )
         fv, source = _resolve_fixed_version(row)
-        assert fv == '148.0.7778.97'
-        assert 'baseline' in source.lower()
+        assert fv == '', (
+            f"No per-CVE rule → _resolve_fixed_version must return empty, got {fv!r}. "
+            f"Use _resolve_baseline for baseline tracking."
+        )
+
+    def test_resolve_baseline_returns_baseline_when_no_per_cve_rule(self):
+        """_resolve_baseline always returns the _baseline regardless of CVE rules."""
+        row = _make_row(
+            status='Installed', matched_version='147.0.7727.117',
+            fixed_version='', install_date='2026-04-29', first_detected='2026-04-11',
+            vulnerability_name='CVE-2026-NOPERRULE', pk='chrome',
+        )
+        bl, bl_src = _resolve_baseline(row)
+        assert bl == '148.0.7778.97', f"Expected _baseline 148.0.7778.97, got {bl!r}"
+        assert 'baseline' in bl_src.lower()
 
     def test_explicit_workbook_column_always_wins(self):
         """If 'Fixed Version' column is present in the row, it overrides everything."""

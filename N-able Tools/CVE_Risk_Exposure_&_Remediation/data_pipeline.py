@@ -221,18 +221,23 @@ def _make_excel_safe(df):
 
 def _resolve_fixed_version(row):
     """
-    Look up the minimum fixed version for a CVE+product combination.
+    Return the CVE-specific minimum fixed version for a CVE+product combination.
 
-    Returns the HIGHEST (strictest) of:
-      1. 'Fixed Version' column in the CVE workbook (explicit override — always wins)
-      2. max(CVE-specific rule, rolling baseline) from config.json
+    Answers: "What is the minimum version that addresses THIS specific CVE?"
 
-    The per-CVE rule is the version that first fixed THIS CVE.  The baseline
-    is the current minimum safe version for the product.  When the baseline
-    has moved past the per-CVE rule (common — browsers release monthly), the
-    baseline is the correct threshold: a device on an old version that happens
-    to be above the per-CVE rule is still vulnerable to later CVEs bundled in
-    the same product update.
+    Priority:
+      1. 'Fixed Version' column in the CVE workbook (explicit override)
+      2. CVE-specific rule in config.json fixed_version_rules
+      3. Empty string if no per-CVE rule exists
+
+    Does NOT fall back to the rolling baseline.  Baseline compliance is a
+    separate concern answered by _resolve_baseline / 'Baseline Compliance'.
+    Keeping them separate means:
+      - A device on Chrome 147.0.7727.117 is correctly "Patch confirmed" for
+        CVE-2026-5858 (fixed at 147.0.7727.55) even though the current
+        baseline is 148.x.
+      - The same device shows "Below baseline" in the Baseline Compliance
+        column, which is also true and actionable — but for a different reason.
     """
     if 'Fixed Version' in row.index:
         v = str(row.get('Fixed Version', '')).strip()
@@ -240,29 +245,58 @@ def _resolve_fixed_version(row):
     product = row.get('_pk', '')
     if not product: return '', ''
     rules = FIXED_VERSION_RULES.get(product, {})
-
-    # Find CVE-specific rule (if any)
-    cve_version = ''
-    cve_source  = ''
     for cve in _extract_cves(str(row.get('Vulnerability Name', ''))):
-        if cve in rules:
-            cve_version = rules[cve]
-            cve_source  = f'config rule ({cve})'
-            break
-
-    # Rolling baseline
-    baseline = rules.get('_baseline', '').strip()
-
-    # Return whichever is higher — the stricter requirement wins
-    if cve_version and baseline:
-        if _version_gte(baseline, cve_version):
-            return baseline, 'rolling baseline (supersedes per-CVE rule)'
-        return cve_version, cve_source
-    if cve_version:
-        return cve_version, cve_source
-    if baseline:
-        return baseline, 'rolling baseline'
+        if cve in rules: return rules[cve], f'config rule ({cve})'
     return '', ''
+
+
+def _resolve_baseline(row) -> tuple[str, str]:
+    """
+    Return the rolling product baseline for the product canonical key.
+
+    Answers: "What is the current minimum recommended version for this product?"
+
+    This is independent of any specific CVE.  A device can be:
+      - CVE compliant (version >= fixed for that CVE)  AND
+      - Below baseline (version < current recommended minimum)
+
+    Both are true and both are actionable — they just mean different things.
+    CVE compliance = this vulnerability is addressed.
+    Baseline compliance = the device is on a currently supported release.
+    """
+    product = row.get('_pk', '')
+    if not product: return '', ''
+    rules = FIXED_VERSION_RULES.get(product, {})
+    baseline = rules.get('_baseline', '').strip()
+    if baseline: return baseline, 'rolling baseline'
+    return '', ''
+
+
+def _classify_baseline_compliance(row) -> str:
+    """
+    Is the installed version at or above the current product baseline?
+
+    Returns one of:
+      'Compliant'           installed >= baseline
+      'Below baseline'      installed < baseline
+      'No baseline defined' no _baseline entry for this product
+      'Version unknown'     version data not available
+      'Not installed'       status is not Installed/Reboot Required
+    """
+    status = str(row.get('Status', '')).strip()
+    if status not in INSTALLED_STATUSES:
+        return 'Not installed'
+    bl = str(row.get('Product Baseline', '')).strip()
+    if not bl:
+        return 'No baseline defined'
+    pv = str(row.get('Matched Patch Version', '')).strip()
+    if not pv:
+        return 'Version unknown'
+    cmp = _version_gte(pv, bl)
+    if cmp is True:  return 'Compliant'
+    if cmp is False: return 'Below baseline'
+    return 'Version unknown'
+
 
 
 def _classify_version_check(row):
@@ -666,18 +700,14 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(rules, dict):
             continue
 
-        # Explicit per-CVE rules — use max(per_cve, baseline) so a stale
-        # per-CVE threshold doesn't falsely resolve when the baseline is stricter
-        baseline_t = product_baselines.get(pk)
+        # Explicit per-CVE rules: CVE is resolved when the installed version
+        # is >= the version that first fixed this specific CVE.
+        # Baseline compliance is tracked separately in 'Baseline Compliance'.
         for cve_id, fixed_str in rules.items():
             if cve_id.startswith('_'):
                 continue
             fixed_t = _parse_version(fixed_str)
-            if not fixed_t:
-                continue
-            # Use the stricter of per-CVE rule and baseline
-            effective_t = max(fixed_t, baseline_t) if baseline_t else fixed_t
-            if ver_info['_vt'] >= effective_t:
+            if fixed_t and ver_info['_vt'] >= fixed_t:
                 cascade_resolve.add((device, pk, cve_id.upper()))
 
         # Baseline fallback: covers all CVEs on this product that have no explicit rule.
@@ -807,10 +837,18 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     fv.columns = ['Fixed Version Used', 'Fixed Version Source']
     best = pd.concat([best, fv], axis=1)
 
+    # Baseline compliance — separate from CVE-specific fix version.
+    # A device can be CVE-compliant (version >= fixed for that CVE) AND below
+    # the current product baseline.  Both are true and both are surfaced.
+    bl = best.apply(_resolve_baseline, axis=1, result_type='expand')
+    bl.columns = ['Product Baseline', 'Product Baseline Source']
+    best = pd.concat([best, bl], axis=1)
+
     best['Matched Patch Version']        = best['_pv'].fillna('')
     best['Matched KBs']                  = best['_kbs'].apply(
         lambda v: ', '.join(v) if isinstance(v, list) else '')
     best['Version Check Result']         = best.apply(_classify_version_check, axis=1)
+    best['Baseline Compliance']          = best.apply(_classify_baseline_compliance, axis=1)
 
     # Rename _pd → Patch Install Date BEFORE calling _classify_resolution so the
     # date-comparison logic can find the column by its final name.
@@ -834,7 +872,8 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     ov_cols = ['Name', 'Device Type', 'Threat Status', 'Vulnerability Score',
                'Affected Products', 'Date Published', 'First detected', 'Last updated',
                'Last Response', 'Matched Patch', 'Patch Install Date',
-               'Patch Match Result', 'Patch Evidence Status']
+               'Patch Match Result', 'Patch Evidence Status',
+               'Product Baseline', 'Baseline Compliance']
     overview = _make_excel_safe(best[[c for c in ov_cols if c in best.columns]])
     return overview, _make_excel_safe(best), _make_excel_safe(patch), total_rows, filtered_rows
 

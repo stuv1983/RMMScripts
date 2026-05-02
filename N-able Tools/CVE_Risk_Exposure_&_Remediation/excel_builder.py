@@ -645,7 +645,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
-                  'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products', 'NVD']
+                  'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products',
+                  'Baseline Compliance', 'NVD']
     for product, group in triage_df.groupby('Base Product'):
         sheet_name = product_to_sheet[product]
         group = group.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
@@ -708,8 +709,9 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             nvd_idx = cl.index('NVD')
             ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
             _write_nvd_links(ws, group['Vulnerability Name'], nvd_idx, link_fmt)
-        if 'Name'        in cl: ws.set_column(cl.index('Name'),        cl.index('Name'),        25)
-        if 'Device Type' in cl: ws.set_column(cl.index('Device Type'), cl.index('Device Type'), 15)
+        if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
+        if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
+        if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
 
         log.debug("Sheet '%s': %d rows written", sheet_name, len(group))
 
@@ -726,6 +728,12 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
             ('#FFFFFF', 'white row',  'Unresolved — patch available but not yet applied'),
         ]
+        # Baseline note below legend
+        ws.write(legend_row + len(legend_entries) + 2, 0,
+                 'ℹ  Baseline Compliance column: shows whether the installed version meets the '
+                 'current rolling product baseline (_baseline in config.json), '
+                 'independently of CVE-specific patch status.',
+                 wb_.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8}))
         ws.write(legend_row, 0, 'Legend', l_title)
         for i, (colour, label, desc) in enumerate(legend_entries, start=1):
             fmt = wb_.add_format({'bg_color': colour, 'font_size': 9, 'border': 1})

@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 # stakeholders and L1/L2 see. Wording implies the action, not just the state.
 DISPLAY_MAP: dict[str, str] = {
     "version_below_fixed": "Patch required",
+    "below_baseline":      "Below current product baseline",
     "version_compliant":   "Patched but still detected (rescan required)",
     "detection_mismatch":  "Patched but still detected (rescan required)",  # same L1 action
     "coverage_gap":        "Device missing from patch report",
@@ -33,8 +34,9 @@ _PENALTIES: dict[str, float] = {
     "version_below_fixed": 2.5,
     "coverage_gap":        2.0,
     "unmanaged_app":       1.5,
+    "below_baseline":      1.0,   # CVE-patched but not on current safe release
     "version_compliant":   1.0,
-    "detection_mismatch":  1.0,   # scanner lying or incorrect fix — not healthy
+    "detection_mismatch":  1.0,
     "no_fixed_baseline":   0.5,
     "no_version_data":     0.5,
 }
@@ -83,6 +85,20 @@ _RULES = [
     ("Matched - failed",      None,         None,                   None),
 ]
 
+def classify_baseline_root_cause(row) -> Optional[str]:
+    """
+    Return 'below_baseline' if the row is CVE-patched but below the product
+    baseline, or None otherwise.
+
+    This runs AFTER classify_root_cause — it adds a second, independent note
+    for rows that are CVE-confirmed but still behind the recommended baseline.
+    A device can have both a root_cause (from CVE matching) AND a baseline cause.
+    """
+    bl_status = str(row.get('Baseline Compliance', '')).strip()
+    if bl_status == 'Below baseline':
+        return 'below_baseline'
+    return None
+
 def classify_root_cause(row) -> Optional[str]:
     """Returns internal cause code or None. No shadow_it guessing — no path data available."""
     pmr = str(row.get("Patch Match Result",          "")).strip()
@@ -103,6 +119,9 @@ _GENERIC: dict[str, list[str]] = {
                             "Deploy managed installer via RMM to replace untracked version"],
     "version_below_fixed": ["Force-push latest version via RMM software deployment",
                             "Check for failed or deferred update policies on affected devices"],
+    "below_baseline":      ["Update product to current baseline version via RMM",
+                            "CVE is addressed but device is below the current minimum safe release",
+                            "Run version_sync.py to confirm _baseline is current"],
     "no_fixed_baseline":   ["Add minimum fixed version to config.json fixed_version_rules",
                             "Check NVD for published fixed version and update config"],
     "version_compliant":   ["Trigger a fresh N-able vulnerability scan on affected devices",
@@ -193,33 +212,52 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
         log.warning("compute_patch_diagnostics: missing columns %s", required - set(df.columns))
         return {"patch_lag_df": _e, "version_drift_df": _e, "root_cause_df": _e, "health_score": _no_h}
 
-    df["_cause"] = df.apply(classify_root_cause, axis=1)
+    df["_cause"]          = df.apply(classify_root_cause, axis=1)
+    df["_baseline_cause"] = df.apply(classify_baseline_root_cause, axis=1)
 
     # ── Root cause / Patch Evidence Notes table (simplified columns) ──────────
     rows = []
-    for _, row in df[df["_cause"].notna()].iterrows():
-        cause = row["_cause"]
-        prod  = str(row.get("Affected Products", ""))
+    for _, row in df[df["_cause"].notna() | df["_baseline_cause"].notna()].iterrows():
+        cause          = row.get("_cause")
+        baseline_cause = row.get("_baseline_cause")
+        prod           = str(row.get("Affected Products", ""))
+        device_name    = str(row.get("Name", ""))
+        cve_id         = extract_cve_id(str(row.get("Vulnerability Name", "")))
 
-        # Skip pairs already resolved by any method — prevents manual ☑ being
-        # contradicted by a classification in Patch Evidence Notes
+        # Skip pairs already resolved by any method
         if resolved_pairs:
-            nk = normalize_device_name(str(row.get("Name", "")))
-            ck = extract_cve_id(str(row.get("Vulnerability Name", "")))
-            if (nk, ck) in resolved_pairs:
+            nk = normalize_device_name(device_name)
+            if (nk, cve_id) in resolved_pairs:
                 continue
 
-        steps = get_recommendations(cause, prod, product_rules)
-        rows.append({
-            "Device":               row.get("Name", ""),
-            "Product":              prod,
-            "CVE":                  extract_cve_id(str(row.get("Vulnerability Name", ""))),
-            "Patch Match Result":   row.get("Patch Match Result", ""),
-            "Resolved":             row.get("Patch Evidence Status", ""),
-            "Patch Evidence Notes": DISPLAY_MAP.get(cause, "Unresolved"),
-            "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
-            "_cause_internal":      cause,   # kept for health score, not written to Excel
-        })
+        # Primary CVE cause row
+        if cause:
+            steps = get_recommendations(cause, prod, product_rules)
+            rows.append({
+                "Device":               device_name,
+                "Product":              prod,
+                "CVE":                  cve_id,
+                "Patch Match Result":   row.get("Patch Match Result", ""),
+                "Resolved":             row.get("Patch Evidence Status", ""),
+                "Patch Evidence Notes": DISPLAY_MAP.get(cause, "Unresolved"),
+                "Baseline Compliance":  row.get("Baseline Compliance", ""),
+                "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
+                "_cause_internal":      cause,
+            })
+        elif baseline_cause:
+            # No CVE-specific issue but below baseline — emit a standalone baseline row
+            steps = get_recommendations(baseline_cause, prod, product_rules)
+            rows.append({
+                "Device":               device_name,
+                "Product":              prod,
+                "CVE":                  cve_id,
+                "Patch Match Result":   row.get("Patch Match Result", ""),
+                "Resolved":             row.get("Patch Evidence Status", ""),
+                "Patch Evidence Notes": DISPLAY_MAP.get(baseline_cause, ""),
+                "Baseline Compliance":  row.get("Baseline Compliance", ""),
+                "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
+                "_cause_internal":      baseline_cause,
+            })
     root_cause_df = (pd.DataFrame(rows).sort_values("Patch Evidence Notes", ignore_index=True)
                      if rows else _e)
 
