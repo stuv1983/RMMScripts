@@ -188,6 +188,25 @@ def _drop_internal(df):
 def _norm_compact(v): return _NORM_CHARS.sub('', str(v).lower()).strip()
 def _norm_text(v):    return _NORM_CHARS.sub(' ', str(v).lower()).strip()
 
+_ARCH_TAG_RE = re.compile(r'[(](x64|x86|32[\-\s]?bit|64[\-\s]?bit)[)]', re.IGNORECASE)
+
+def _get_arch(text: str) -> str:
+    """
+    Extract the architecture tag from a product name or patch entry.
+    Returns 'x64', 'x86', or '' when no tag is present.
+
+    Examples:
+        'Mozilla Firefox (x64)'        → 'x64'
+        'Firefox (x86) 150.0.1'        → 'x86'
+        'Google Chrome'                → ''   (no tag — neutral)
+        'Microsoft Edge 80+'           → ''   (no tag — neutral)
+    """
+    m = _ARCH_TAG_RE.search(str(text))
+    if not m:
+        return ''
+    a = m.group(1).lower()
+    return 'x86' if ('x86' in a or '32' in a) else 'x64'
+
 STATUS_RANK = {'Installed': 6, 'Reboot Required': 5, 'Installing': 4,
                 'Pending': 3, 'Missing': 2, 'Failed': 1}
 STATUS_LABEL = {
@@ -694,13 +713,17 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
 
     best_ver: dict[tuple, dict] = {}
     for _, row in has_ver.iterrows():
-        key = (str(row['Name']), str(row['_cascade_pk']))
+        # Include arch in the key so x86 and x64 installs are tracked independently.
+        # An x86 version cannot be used as cascade evidence for an x64 CVE.
+        _patch_arch = _get_arch(str(row.get('Matched Patch', '')))
+        key = (str(row['Name']), str(row['_cascade_pk']), _patch_arch)
         vt  = row['_vt']
         if key not in best_ver or vt > best_ver[key]['_vt']:
             best_ver[key] = {
                 '_vt':          vt,
                 'version_str':  str(row['Matched Patch Version']),
                 'install_date': row.get('Patch Install Date', pd.NaT),
+                '_arch':        _patch_arch,
             }
 
     # Step 2: build set of (device, product_key, cve_id) that cascade-satisfy
@@ -718,7 +741,7 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
             if bt:
                 product_baselines[pk] = bt
 
-    for (device, pk), ver_info in best_ver.items():
+    for (device, pk, inst_arch), ver_info in best_ver.items():
         rules = FIXED_VERSION_RULES.get(pk, {})
         if not isinstance(rules, dict):
             continue
@@ -731,14 +754,13 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
                 continue
             fixed_t = _parse_version(fixed_str)
             if fixed_t and ver_info['_vt'] >= fixed_t:
-                cascade_resolve.add((device, pk, cve_id.upper()))
+                # Include arch in cascade key: (device, pk, cve_id, inst_arch)
+                # Step 3 will only apply this to CVE rows with a matching arch.
+                cascade_resolve.add((device, pk, cve_id.upper(), inst_arch))
 
-        # Baseline fallback: covers all CVEs on this product that have no explicit rule.
-        # We don't know the per-CVE threshold, but if the device is above the
-        # minimum safe release we treat all unresolved CVEs on that product as covered.
+        # Baseline fallback
         if pk in product_baselines and ver_info['_vt'] >= product_baselines[pk]:
-            # Mark with a sentinel so we can apply to any CVE on this product
-            cascade_resolve.add((device, pk, '_BASELINE_'))
+            cascade_resolve.add((device, pk, '_BASELINE_', inst_arch))
 
     if not cascade_resolve:
         return df
@@ -755,16 +777,32 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         pk      = str(row.get('_cascade_pk', ''))
         cve_ids = [c.upper() for c in _extract_cves(str(row.get('Vulnerability Name', '')))]
 
-        key = (device, pk)
-        if key not in best_ver:
-            continue
+        # Arch guard: the cascade key now includes arch so we only resolve
+        # a CVE row when the installed version has the same arch as the CVE.
+        # When either side has no arch tag, we allow the cascade (neutral).
+        cve_arch = _get_arch(str(row.get('Affected Products', '')))
+
+        # Find the best_ver entry for this device+product+arch combination.
+        # Prefer arch-matched key; fall back to no-arch key if no match found.
+        key_exact   = (device, pk, cve_arch)
+        key_neutral = (device, pk, '')
+        if key_exact in best_ver:
+            key = key_exact
+        elif key_neutral in best_ver and not cve_arch:
+            key = key_neutral
+        elif not cve_arch and any(k[:2] == (device, pk) for k in best_ver):
+            # CVE has no arch — allow any arch version as evidence
+            key = next(k for k in best_ver if k[:2] == (device, pk))
+        else:
+            continue  # no matching version found for this arch
 
         ver_info   = best_ver[key]
         install_dt = pd.to_datetime(ver_info['install_date'], errors='coerce')
         first_dt   = pd.to_datetime(row.get('First detected', pd.NaT), errors='coerce')
+        inst_arch  = ver_info['_arch']
 
         for cve_id in cve_ids:
-            if (device, pk, cve_id) in cascade_resolve:
+            if (device, pk, cve_id, inst_arch) in cascade_resolve or                (not cve_arch and any((device, pk, cve_id, a) in cascade_resolve for a in ['', 'x64', 'x86'])):
                 # Explicit CVE rule matched + version compliant, but still require
                 # timing proof. This prevents a pre-existing installed row from
                 # resolving an active CVE when the patch report did not prove
@@ -773,7 +811,8 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                     cascade_applied += 1
                     break
-            elif (device, pk, '_BASELINE_') in cascade_resolve:
+            elif (device, pk, '_BASELINE_', inst_arch) in cascade_resolve or \
+                   (not cve_arch and any((device, pk, '_BASELINE_', a) in cascade_resolve for a in ['', 'x64', 'x86'])):
                 # Baseline: also need timing check (we don't know the per-CVE threshold)
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
                     df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
@@ -848,6 +887,18 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
     def _classify_match(row):
         if not pd.isna(row.get('Patch')):
+            # Architecture guard: if both the CVE detection and the matched
+            # patch carry an explicit arch tag, they must agree.
+            # A 32-bit patch cannot be evidence that a 64-bit install is fixed.
+            # Example: CVE on Firefox (x64) must NOT match patch Firefox (x86).
+            # When either side has no arch tag we allow the match — the product
+            # may not be tagged at all (e.g. 'Google Chrome', 'Microsoft Edge 80+').
+            cve_arch   = _get_arch(str(row.get('Affected Products', '')))
+            patch_arch = _get_arch(str(row.get('Patch', '')))
+            if cve_arch and patch_arch and cve_arch != patch_arch:
+                # Cross-arch mismatch: treat as if the device is in the patch
+                # report but the correct-arch product was not found.
+                return 'Device in patch report - product not found'
             return STATUS_LABEL.get(str(row.get('Status', '')).strip(),
                                      f"Matched - {str(row.get('Status', '')).lower()}")
         if (row['_ck'], row['_sk'], row['_dk']) in patch_devices:
