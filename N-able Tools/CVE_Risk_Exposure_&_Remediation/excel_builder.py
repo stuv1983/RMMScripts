@@ -738,10 +738,26 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         group = group.sort_values(
             by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
 
+        # Derive canonical product key for this sheet's product so the resolved
+        # lookup uses (device, cve, canonical_product) instead of (device, cve).
+        # This prevents Edge patch evidence bleeding into Chrome rows for the
+        # same CVE — a cross-product false-positive resolved tick.
+        from data_pipeline import _detect_product as _dp_detect_prod
+        _sheet_pk = _dp_detect_prod(str(product))
+
         def _resolved_value(row):
             nk = normalize_device_name(row['Name'])
             ck = extract_cve_id(row['Vulnerability Name'])
-            return '☑' if (nk, ck) in patch_resolved_pairs else '☐'
+            # Check product-scoped key first; fall back to product-free key
+            # for backwards compatibility when patch_resolved_pairs was built
+            # without product (e.g. loaded from an older dashboard workbook).
+            if (nk, ck, _sheet_pk) in patch_resolved_pairs:
+                return '☑'
+            # If any 3-tuple key exists for (nk, ck) — new format present
+            # If only 2-tuple keys exist — old format, use old check
+            if patch_resolved_pairs and len(next(iter(patch_resolved_pairs))) == 2:
+                return '☑' if (nk, ck) in patch_resolved_pairs else '☐'
+            return '☐'
 
         group.insert(0, 'Resolved', group.apply(_resolved_value, axis=1))
         group['NVD'] = ''
@@ -780,7 +796,13 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         for row_i, (_, row) in enumerate(group[final_cols].iterrows(), start=1):
             nk = normalize_device_name(str(row.get('Name', '')))
             ck = extract_cve_id(str(row.get('Vulnerability Name', '')))
-            if (nk, ck) in patch_resolved_pairs:
+            _is_resolved = (
+                (nk, ck, _sheet_pk) in patch_resolved_pairs
+                or (len(patch_resolved_pairs) > 0
+                    and len(next(iter(patch_resolved_pairs))) == 2
+                    and (nk, ck) in patch_resolved_pairs)
+            )
+            if _is_resolved:
                 ws.set_row(row_i, None, patch_res_fmt)
             elif str(row.get('Has Known Exploit', '')).strip().lower() in _TRUE_VALS:
                 ws.set_row(row_i, None, exploit_fmt)

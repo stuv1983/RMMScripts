@@ -21,24 +21,37 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.request
-import urllib.error
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+_UA = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact your-email@example.com)'
 _TIMEOUT = 10  # seconds
+_RETRY   = 3
+
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=_RETRY, backoff_factor=1,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={'GET'}, raise_on_status=False,
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retry))
+    session.headers.update({'User-Agent': _UA, 'Accept': 'application/json'})
+    return session
 
 
 def _fetch(url: str) -> dict | list:
-    req = urllib.request.Request(
-        url,
-        headers={'User-Agent': _UA, 'Accept': 'application/json'},
-    )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-        return json.loads(r.read())
+    """HTTP GET via shared session with retry/backoff. Returns parsed JSON."""
+    session = _make_session()
+    resp = session.get(url, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ==============================================================================

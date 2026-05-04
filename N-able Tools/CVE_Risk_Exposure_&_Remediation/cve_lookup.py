@@ -46,17 +46,47 @@ import logging
 import os
 import re
 import time
-import urllib.request
-import urllib.error
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
 _UA      = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact your-email@example.com)'
-_TIMEOUT = 12
-_RETRY   = 2
+_TIMEOUT    = 8    # connect + read timeout per request attempt
+_RETRY      = 2    # reduced: 2 retries × 3 sources × 98 CVEs = still slow if all fail
 _DELAY   = 0.5   # seconds between API calls — be a polite client
+
+
+def _make_session() -> requests.Session:
+    """Build a requests.Session with automatic retry and exponential backoff.
+    Retries up to 3 times on 429/500/502/503/504 with backoff 1s/2s/4s.
+    Connection pooling is reused across all calls within a lookup run.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total            = _RETRY,
+        backoff_factor   = 1,
+        status_forcelist = {429, 500, 502, 503, 504},
+        allowed_methods  = {'GET'},
+        raise_on_status  = False,
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retry))
+    session.headers.update({'User-Agent': _UA, 'Accept': 'application/json'})
+    return session
+
+
+_SESSION: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    """Return the module-level session, creating it on first call."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = _make_session()
+    return _SESSION
 
 
 def _mask_key(value: str) -> str:
@@ -146,30 +176,36 @@ def test_nvd_api_access(config_path: Optional[str] = None, cve_id: str = 'CVE-20
 # ==============================================================================
 
 def _get(url: str, extra_headers: Optional[dict[str, str]] = None) -> Optional[dict]:
-    """HTTP GET with retries. Returns parsed JSON or None on failure."""
-    headers = {'User-Agent': _UA, 'Accept': 'application/json'}
-    if extra_headers:
-        headers.update(extra_headers)
+    """
+    HTTP GET with automatic retry and exponential backoff via requests.Session.
 
-    for attempt in range(_RETRY):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                log.debug("HTTP 404 from %s — CVE not found", url[:80])
-                return None          # CVE not found — not a retry candidate
-            if e.code in (403, 429):
-                log.warning("Rate limited or blocked by %s — HTTP %d; waiting 5s", url[:80], e.code)
-                time.sleep(5)
-            else:
-                log.debug("HTTP %d from %s (attempt %d)", e.code, url[:80], attempt + 1)
-        except Exception as e:
-            log.debug("Fetch failed %s: %s (attempt %d)", url[:80], e, attempt + 1)
+    The session handles 429/500/502/503/504 retries transparently with
+    exponential backoff (1s, 2s, 4s).  Returns parsed JSON on success,
+    None on 404/403 or after all retries are exhausted.
+    """
+    try:
+        session = _get_session()
+        resp = session.get(
+            url,
+            headers=extra_headers or {},
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            log.debug("HTTP 404 from %s — resource not found", url[:80])
+            return None
+        if resp.status_code == 403:
+            log.warning("HTTP 403 from %s — check API key or access permissions", url[:80])
+            return None
+        resp.raise_for_status()
         time.sleep(_DELAY)
+        return resp.json()
+    except requests.exceptions.RetryError as e:
+        log.warning("Fetch failed after retries: %s — %s", url[:80], e)
+    except requests.exceptions.Timeout:
+        log.debug("Timeout fetching %s (limit %ds)", url[:80], _TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        log.debug("Fetch error %s: %s", url[:80], e)
     return None
-
 
 def _parse_cve_org(data: dict) -> list[dict]:
     """
@@ -891,53 +927,123 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
     config_dirty = False   # track whether product_map was modified
     before_product_map_count = len(cfg.get('product_map', []))
 
+    # ── No-data cache ─────────────────────────────────────────────────────────
+    # CVEs that returned no version data from any source are cached in
+    # config.json so subsequent runs skip the API entirely.
+    # Cache is invalidated after 30 days to pick up delayed NVD/CVE.org entries.
+    import datetime as _dt
+    _no_data_cache: dict = cfg.setdefault('cve_no_data_cache', {})
+    _cache_ttl_days = 30
+    _now_str = _dt.datetime.utcnow().strftime('%Y-%m-%d')
+
+    def _cache_is_fresh(cve: str) -> bool:
+        entry = _no_data_cache.get(cve)
+        if not entry:
+            return False
+        try:
+            age = (_dt.datetime.utcnow() -
+                   _dt.datetime.strptime(entry, '%Y-%m-%d')).days
+            return age < _cache_ttl_days
+        except (ValueError, TypeError):
+            return False
+
+    skipped_cached = [c for c in cve_ids if _cache_is_fresh(c.strip().upper())]
+    cve_ids = [c for c in cve_ids if not _cache_is_fresh(c.strip().upper())]
+    if skipped_cached:
+        log.info("cve_lookup: skipping %d CVE(s) with no-data cache hit "
+                 "(cached within %d days): %s%s",
+                 len(skipped_cached), _cache_ttl_days,
+                 ', '.join(skipped_cached[:5]),
+                 ' ...' if len(skipped_cached) > 5 else '')
+
+    # ── Concurrent lookup ─────────────────────────────────────────────────────
+    # Sequential lookups at _DELAY apart are slow when many CVEs have no data
+    # (each burns full timeout × retries across 3 sources).  Run lookups
+    # concurrently with a bounded thread pool and a semaphore to stay polite.
+    #
+    # Thread safety notes:
+    #   - cfg / product_map mutations (auto_add_products) are serialised via lock
+    #   - results dict is written once per CVE after the lookup completes
+    #   - _SESSION (requests) is thread-safe (connection pool is thread-safe)
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _MAX_WORKERS  = 6   # concurrent CVE lookups
+    _API_SEMAPHORE = threading.Semaphore(_MAX_WORKERS)
+    _cfg_lock      = threading.Lock()
+
+    def _lookup_one(cve: str) -> tuple[str, dict]:
+        """Lookup one CVE and return (cve_id, matched_dict)."""
+        with _API_SEMAPHORE:
+            time.sleep(_DELAY)   # polite delay inside semaphore
+            return cve, lookup_fixed_version(
+                cve,
+                product_map,     # read-only snapshot per call
+                cfg=None,        # auto_add done serially after (thread safety)
+                auto_add_products=False,
+                config_path=str(config_path),
+            )
+
     for cve_id in cve_ids:
-        cve_id = cve_id.strip().upper()
+        cve_ids_upper = [c.strip().upper() for c in cve_ids]
 
-        # Pass the live cfg so lookup_fixed_version can mutate product_map
-        # in place when auto_add_products is True.  After a successful auto-add
-        # the updated product_map is in cfg['product_map']; rebuild product_map
-        # tuple list so subsequent CVEs in this loop benefit from new entries.
-        matched = lookup_fixed_version(
-            cve_id,
-            product_map,
-            cfg=cfg if auto_add_products else None,
-            auto_add_products=auto_add_products,
-            config_path=str(config_path),
-        )
-
-        # Rebuild product_map from cfg in case auto-add mutated it
-        new_pm = [(str(k).lower(), str(v).lower()) for k, v in cfg.get('product_map', [])]
-        if new_pm != product_map:
-            product_map  = new_pm
-            config_dirty = True
-
-        if not matched:
-            continue
-
-        results[cve_id] = matched
-
-        # Sync fvr from cfg (auto-add may have added new canonical keys)
-        fvr = cfg.setdefault('fixed_version_rules', {})
-
-        for pk, fv in matched.items():
-            if pk not in fvr:
-                fvr[pk] = {}
-            if not isinstance(fvr[pk], dict):
-                fvr[pk] = {}
-
-            if cve_id in fvr[pk] and not overwrite:
-                log.info("cve_lookup: %s/%s already has value %s — skipping (use --overwrite to replace)",
-                         pk, cve_id, fvr[pk][cve_id])
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_lookup_one, c.strip().upper()): c
+                   for c in cve_ids}
+        for future in as_completed(futures):
+            try:
+                cve_id, matched = future.result()
+            except Exception as exc:
+                log.warning("cve_lookup: unexpected error for %s: %s", futures[future], exc)
                 continue
 
-            old = fvr[pk].get(cve_id, '(not set)')
-            fvr[pk][cve_id] = fv
-            cfg['fixed_version_rules'] = fvr
-            config_dirty = True
-            log.info("cve_lookup: config.json %s/%s: %s → %s", pk, cve_id, old, fv)
+            if not matched:
+                # Cache the no-data result so next run skips this CVE
+                with _cfg_lock:
+                    _no_data_cache[cve_id] = _now_str
+                    cfg['cve_no_data_cache'] = _no_data_cache
+                    config_dirty = True
+                continue
 
-        time.sleep(_DELAY)   # be polite between CVE lookups
+            results[cve_id] = matched
+
+            with _cfg_lock:
+                # Auto-add products serially (mutates product_map / cfg)
+                if auto_add_products:
+                    for r_vendor, r_product, r_fv in matched.get('_raw_entries', []):
+                        canonical = _auto_update_product_map(
+                            r_vendor, r_product, r_fv, cve_id, cfg)
+                        if canonical:
+                            product_map = [(str(k).lower(), str(v).lower())
+                                           for k, v in cfg.get('product_map', [])]
+                            config_dirty = True
+
+                # Sync fvr from cfg
+                fvr = cfg.setdefault('fixed_version_rules', {})
+
+                for pk, fv in matched.items():
+                    if pk.startswith('_'):
+                        continue
+                    if pk not in fvr:
+                        fvr[pk] = {}
+                    if not isinstance(fvr[pk], dict):
+                        fvr[pk] = {}
+                    if cve_id in fvr[pk] and not overwrite:
+                        log.info("cve_lookup: %s/%s already has value %s — skipping",
+                                 pk, cve_id, fvr[pk][cve_id])
+                        continue
+                    old = fvr[pk].get(cve_id, '(not set)')
+                    fvr[pk][cve_id] = fv
+                    cfg['fixed_version_rules'] = fvr
+                    config_dirty = True
+                    log.info("cve_lookup: config.json %s/%s: %s → %s", pk, cve_id, old, fv)
+
+                # Rebuild product_map if auto-add mutated it
+                new_pm = [(str(k).lower(), str(v).lower())
+                          for k, v in cfg.get('product_map', [])]
+                if new_pm != product_map:
+                    product_map  = new_pm
+                    config_dirty = True
 
     if config_dirty and not dry_run:
         with open(config_path, 'w', encoding='utf-8') as fh:
@@ -996,9 +1102,31 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                 known.update(k.upper() for k in pk_rules
                              if k.upper().startswith('CVE-'))
 
+        # Also skip CVEs in the no-data cache (returned nothing from all sources
+        # within the last 30 days).  This prevents re-hitting APIs for CVEs
+        # with no public version data yet — the main cause of slow runs.
+        import datetime as _dt
+        _no_data = cfg.get('cve_no_data_cache', {})
+        _ttl = 30
+        def _fresh(cve: str) -> bool:
+            d = _no_data.get(cve)
+            if not d:
+                return False
+            try:
+                return (_dt.datetime.utcnow() -
+                        _dt.datetime.strptime(d, '%Y-%m-%d')).days < _ttl
+            except (ValueError, TypeError):
+                return False
+
         all_cves = cve_df['Vulnerability Name'].apply(extract_cve_id).unique()
         missing  = [c for c in all_cves
-                    if c.upper() not in known and c.upper().startswith('CVE-')]
+                    if (c.upper() not in known and c.upper().startswith('CVE-')
+                        and not _fresh(c.upper()))]
+
+        cached_skip = sum(1 for c in all_cves
+                          if c.upper().startswith('CVE-') and _fresh(c.upper()))
+        if cached_skip:
+            log.info("cve_lookup: skipping %d CVE(s) in no-data cache", cached_skip)
 
         if not missing:
             log.debug("cve_lookup: all %d CVEs already have version data", len(all_cves))

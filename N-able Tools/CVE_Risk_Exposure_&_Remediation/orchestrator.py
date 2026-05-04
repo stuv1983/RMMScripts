@@ -28,6 +28,7 @@ from data_pipeline import (
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
 from excel_builder import (
+    get_workbook_styles,
     build_trend_summary_sheet, build_trend_detail_sheets,
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
@@ -345,7 +346,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     break
 
         # ── Classify patch gaps (explicit yellow-state categories) ────────────
-        patch_resolved_pairs: Set[Tuple[str, str]] = set()
+        patch_resolved_pairs: Set[Tuple[str, str, str]] = set()  # (device, cve, canonical_product)
         patch_gap_pairs:      dict[Tuple[str, str], str] = {}
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
@@ -357,9 +358,20 @@ def run(request: DashboardRequest) -> DashboardResult:
             p_full['_ck'] = p_full['Vulnerability Name'].astype(str).apply(extract_cve_id)
 
             if 'Patch Evidence Status' in p_full.columns:
+                confirmed = p_full[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan']
+                # Key is (device, cve, canonical_product) so Edge patch evidence
+                # cannot bleed into Chrome product sheet rows for the same CVE.
+                # _cascade_pk carries the canonical product key (e.g. 'edge', 'chrome').
+                # Fall back to Affected Products if _cascade_pk is absent.
+                if '_cascade_pk' in confirmed.columns:
+                    pk_col = confirmed['_cascade_pk'].astype(str)
+                else:
+                    from data_pipeline import _detect_product as _dp_detect
+                    pk_col = confirmed['Affected Products'].astype(str).apply(_dp_detect)
                 patch_resolved_pairs = set(zip(
-                    p_full.loc[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan', '_nk'],
-                    p_full.loc[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan', '_ck'],
+                    confirmed['_nk'],
+                    confirmed['_ck'],
+                    pk_col,
                 ))
                 log.info("Patch-confirmed resolved pairs: %d", len(patch_resolved_pairs))
 
@@ -395,9 +407,11 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         patch_confirmed_count = 0
         if patch_resolved_pairs:
+            from data_pipeline import _detect_product as _dp_detect
             triage_keys = set(zip(
                 triage_df['Name'].apply(normalize_device_name),
                 triage_df['Vulnerability Name'].apply(extract_cve_id),
+                triage_df['Affected Products'].astype(str).apply(_dp_detect),
             ))
             patch_confirmed_count = len(patch_resolved_pairs & triage_keys)
 
@@ -440,10 +454,10 @@ def run(request: DashboardRequest) -> DashboardResult:
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:
             wb = writer.book
-            link_fmt   = wb.add_format({'font_color': 'blue', 'underline': True})
-            header_fmt = wb.add_format({'bold': True, 'font_size': 12,
-                                        'bg_color': '#D9D9D9', 'border': 1})
-            miss_fmt   = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+            styles     = get_workbook_styles(wb)
+            link_fmt   = styles['link']
+            header_fmt = styles['header']
+            miss_fmt   = styles['row_missing']
 
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
@@ -489,9 +503,13 @@ def run(request: DashboardRequest) -> DashboardResult:
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
 
-                # Devices in CVE data but absent from patch report entirely
+                # Devices in CVE data but absent from patch report entirely.
+                # Use the raw patch report (patch_data[2]) NOT the merged PMFD
+                # (patch_data[1]).  The PMFD contains every CVE-export device
+                # including those with 'Not found in patch report' — using it
+                # would incorrectly mark all devices as "present in patch report".
                 patch_report_devices = set(
-                    patch_data[1]['Name'].apply(normalize_device_name).unique()
+                    patch_data[2]['Device'].apply(normalize_device_name).unique()
                 ) if patch_data else set()
 
                 build_not_in_patch_scope_sheet(

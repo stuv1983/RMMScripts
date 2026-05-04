@@ -237,10 +237,13 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
         device_name    = str(row.get("Name", ""))
         cve_id         = extract_cve_id(str(row.get("Vulnerability Name", "")))
 
-        # Skip pairs already resolved by any method
+        # Skip pairs already resolved by any method.
+        # resolved_pairs may contain 2-tuples (device, cve) or 3-tuples (device, cve, product).
         if resolved_pairs:
             nk = normalize_device_name(device_name)
-            if (nk, cve_id) in resolved_pairs:
+            from data_pipeline import _detect_product as _dp_det
+            _pk = _dp_det(str(row.get("Affected Products", "")))
+            if (nk, cve_id) in resolved_pairs or (nk, cve_id, _pk) in resolved_pairs:
                 continue
 
         # Primary CVE cause row
