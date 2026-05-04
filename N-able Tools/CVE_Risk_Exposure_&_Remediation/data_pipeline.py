@@ -93,10 +93,25 @@ def load_data(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
 def normalize_device_name(name: str) -> str:
+    """Row-level device name normalisation (used for single values)."""
     name = str(name).strip().upper()
     if '\\' in name: name = name.split('\\')[-1]
     if '.'  in name: name = name.split('.')[0]
     return name
+
+
+def _normalize_device_col(series: 'pd.Series') -> 'pd.Series':
+    """
+    Vectorised version of normalize_device_name for DataFrame columns.
+    Uses pandas str methods (C-level) instead of a Python-level apply loop.
+    Equivalent transformation: strip → upper → take last \\-segment → take first .-segment.
+    """
+    s = series.astype(str).str.strip().str.upper()
+    # split on backslash, take last part (handles DOMAIN\HOSTNAME)
+    s = s.str.split('\\\\').str[-1]
+    # split on dot, take first part (handles FQDN)
+    s = s.str.split('\\.').str[0]
+    return s
 
 def get_base_product(prod_name: str) -> str:
     p = str(prod_name).strip()
@@ -436,9 +451,17 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
         if col not in df.columns: df[col] = default
 
     df['Vulnerability Name'] = df['Vulnerability Name'].fillna('Unknown CVE')
-    df['Name_Join']          = df['Name'].apply(normalize_device_name)
+    df['Name_Join']          = _normalize_device_col(df['Name'])
     df['Affected Products']  = df['Affected Products'].fillna('Unknown Product')
     df['Base Product']       = df['Affected Products'].apply(get_base_product)
+
+    # NOTE: category dtype is intentionally NOT used here even though these
+    # columns are low-cardinality. In pandas < 3.0, groupby() on category
+    # columns defaults to observed=False, producing the cartesian product of
+    # all category value combinations. process_patch_match() groups by all
+    # CVE columns including Vulnerability Severity and Threat Status, so a
+    # 5-severity * 3-status * 2-exploit * 2-kev cross with hundreds of
+    # device/CVE rows produces trillions of rows → numpy MemoryError.
     return df
 
 def load_rmm_data(file_path):
@@ -478,7 +501,7 @@ def load_rmm_data(file_path):
             )
 
     df.rename(columns={dev_col: 'Device', resp_col: 'Last Response'}, inplace=True)
-    df['Device_Join'] = df['Device'].apply(normalize_device_name)
+    df['Device_Join'] = _normalize_device_col(df['Device'])
 
     if device_type_col:
         # Map N-able device type strings → Server / Workstation / Unknown
@@ -1139,11 +1162,15 @@ def compute_trends(current_df, previous_df, threshold,
         'remediated_devices':  len(prev_dev_set - cur_dev_set),
     }
 
-    # ── Product-level trend (Top 10, common-product scope) ───────────────────
-    cur_prod  = cur_scoped.groupby('Base Product')['_Name_Key'].nunique()
-    prev_prod = prev_scoped.groupby('Base Product')['_Name_Key'].nunique()
-    cur_cve_prod  = cur_scoped.groupby('Base Product')['_CVE_Key'].nunique()
-    prev_cve_prod = prev_scoped.groupby('Base Product')['_CVE_Key'].nunique()
+    # ── Product-level trend (Top 10, FULL current scope) ────────────────────
+    # Use cur_t (all current products, not just common-product scope) so that
+    # newly-appearing products (e.g. Edge detected this month for the first time)
+    # are included with Previous = 0 rather than being silently omitted.
+    # Previous counts for new products are naturally 0 (absent from prev_scoped).
+    cur_prod      = cur_t.groupby('Base Product')['_Name_Key'].nunique()
+    cur_cve_prod  = cur_t.groupby('Base Product')['_CVE_Key'].nunique()
+    prev_prod     = prev_t.groupby('Base Product')['_Name_Key'].nunique()
+    prev_cve_prod = prev_t.groupby('Base Product')['_CVE_Key'].nunique()
     product_trend = (
         pd.DataFrame({
             'Current':     cur_prod,

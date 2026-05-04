@@ -25,6 +25,9 @@ DISPLAY_MAP: dict[str, str] = {
     "detection_mismatch":  "Patched but still detected (rescan required)",  # same L1 action
     "coverage_gap":        "Device missing from patch report",
     "unmanaged_app":       "Product not tracked",
+    "patch_installing":    "Patch installing — in progress",
+    "patch_pending":       "Patch pending — scheduled, not yet started",
+    "patch_missing":       "Patch missing — not yet deployed to device",
     "no_version_data":     "Installed but version unknown",
     "no_fixed_baseline":   "No patch baseline defined",
 }
@@ -38,6 +41,9 @@ _PENALTIES: dict[str, float] = {
     "version_compliant":   1.0,
     "detection_mismatch":  1.0,
     "no_fixed_baseline":   0.5,
+    "patch_installing":    0.3,
+    "patch_pending":       0.5,   # scheduled but not delivered
+    "patch_missing":       1.5,   # patch tool knows device needs it but hasn't delivered
     "no_version_data":     0.5,
 }
 
@@ -126,6 +132,13 @@ _GENERIC: dict[str, list[str]] = {
                             "Check NVD for published fixed version and update config"],
     "version_compliant":   ["Trigger a fresh N-able vulnerability scan on affected devices",
                             "Verify N-able detection signatures are up to date"],
+    "patch_installing":    ["Patch is in progress — re-run report after next RMM sync to confirm completion",
+                            "If status remains Installing for >24h, check RMM agent and patch policy for errors"],
+    "patch_pending":       ["Patch is scheduled — verify patch policy is active and device is online",
+                            "Re-run report after next RMM maintenance window"],
+    "patch_missing":       ["Force deploy patch via RMM software deployment",
+                            "Check patch policy scope includes this device",
+                            "Verify RMM agent is reporting correctly on affected device"],
     "no_version_data":     ["Force RMM agent inventory sync on affected devices",
                             "Reinstall or update RMM agent if version data is consistently missing"],
     "detection_mismatch":  ["Trigger a fresh N-able vulnerability scan on affected devices",

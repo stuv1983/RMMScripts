@@ -417,3 +417,78 @@ class TestClassifyResolution:
         row['Version Check Result'] = 'Version compliant'
         result = _classify_resolution(row)
         assert result == 'Patch confirmed - pending rescan'
+
+
+# ==============================================================================
+# Product trend tests
+# ==============================================================================
+
+class TestProductTrend:
+    """Tests for compute_trends product_trend construction."""
+
+    def _make_cve_df(self, rows):
+        """Build a minimal CVE DataFrame for trend testing."""
+        import data_pipeline as dp
+        df = pd.DataFrame(rows)
+        df['Vulnerability Score'] = pd.to_numeric(df['Vulnerability Score'], errors='coerce')
+        df['_Name_Key']  = df['Name'].apply(dp.normalize_device_name)
+        df['_CVE_Key']   = df['Vulnerability Name']
+        df['Base Product'] = df['Affected Products'].apply(dp.get_base_product)
+        return df
+
+    def test_new_product_appears_in_trend_with_prev_zero(self):
+        """
+        A product present in current but absent from previous must appear in
+        product_trend with Previous = 0.  This was the Edge bug: Edge appeared
+        this month for the first time and was silently omitted from the Trend
+        Summary Top 10 because it wasn't in common_products.
+        """
+        import data_pipeline as _dp
+
+        cur = self._make_cve_df([
+            {'Name': 'D1', 'Vulnerability Name': 'CVE-2026-0001',
+             'Affected Products': 'Microsoft Edge 80+', 'Vulnerability Score': 9.6,
+             'Last Response': '2026-04-01'},
+            {'Name': 'D2', 'Vulnerability Name': 'CVE-2026-0001',
+             'Affected Products': 'Microsoft Edge 80+', 'Vulnerability Score': 9.6,
+             'Last Response': '2026-04-01'},
+            {'Name': 'D1', 'Vulnerability Name': 'CVE-2026-0002',
+             'Affected Products': 'Google Chrome', 'Vulnerability Score': 9.6,
+             'Last Response': '2026-04-01'},
+        ])
+        prev = self._make_cve_df([
+            {'Name': 'D1', 'Vulnerability Name': 'CVE-2026-0002',
+             'Affected Products': 'Google Chrome', 'Vulnerability Score': 9.6,
+             'Last Response': '2026-03-01'},
+        ])
+
+        result = _dp.compute_trends(cur, prev, threshold=9.0)
+        pt = result['product_trend']
+
+        # Edge must appear even though it wasn't in the previous report
+        assert 'Microsoft Edge' in pt.index, (
+            "Microsoft Edge must appear in product_trend even when absent from previous report. "
+            "It was absent before, so Previous should be 0."
+        )
+        edge_row = pt.loc['Microsoft Edge']
+        assert edge_row['Current']  == 2, f"Edge: expected 2 devices, got {edge_row['Current']}"
+        assert edge_row['Previous'] == 0, f"Edge: expected Previous=0 (new product), got {edge_row['Previous']}"
+        assert edge_row['Change']   == 2, f"Edge: expected Change=+2, got {edge_row['Change']}"
+
+    def test_existing_product_shows_delta(self):
+        """Products present in both periods show correct Prev/Current/Change."""
+        import data_pipeline as _dp
+
+        def _rows(devices, cve='CVE-2026-0001', product='Google Chrome', score=9.6, date='2026-04-01'):
+            return [{'Name': d, 'Vulnerability Name': cve, 'Affected Products': product,
+                     'Vulnerability Score': score, 'Last Response': date}
+                    for d in devices]
+
+        cur  = self._make_cve_df(_rows(['D1','D2','D3']))
+        prev = self._make_cve_df(_rows(['D1','D2'], date='2026-03-01'))
+
+        pt = _dp.compute_trends(cur, prev, threshold=9.0)['product_trend']
+        chrome = pt.loc['Google Chrome']
+        assert chrome['Current']  == 3
+        assert chrome['Previous'] == 2
+        assert chrome['Change']   == 1

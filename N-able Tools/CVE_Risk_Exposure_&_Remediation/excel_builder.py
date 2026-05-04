@@ -25,6 +25,70 @@ log = logging.getLogger(__name__)
 # reads the cell back as 0.  Use write_url() instead: it stores the display
 # text as the cached value so the cell is correctly readable by any reader.
 
+
+# ==============================================================================
+# WORKBOOK STYLE REGISTRY
+# ==============================================================================
+
+def get_workbook_styles(wb) -> dict:
+    """
+    Build all shared xlsxwriter Format objects once per workbook.
+
+    Calling wb.add_format() is cheap but xlsxwriter tracks every format
+    object for the workbook lifetime.  Creating the same format in multiple
+    sheet-builder functions generates duplicate entries and makes colour
+    inconsistencies easy to introduce.  A single registry call at workbook
+    open time guarantees consistency and makes palette changes a one-liner.
+
+    Usage:
+        styles = get_workbook_styles(wb)
+        ws.write(row, col, text, styles['header'])
+    """
+    return {
+        # ── Title / header ────────────────────────────────────────────────────
+        'title':        wb.add_format({'bold': True, 'font_size': 14,
+                                       'bg_color': '#1F4E79', 'font_color': 'white', 'border': 1}),
+        'header':       wb.add_format({'bold': True, 'font_size': 12,
+                                       'bg_color': '#D9D9D9', 'border': 1}),
+        'sub_header':   wb.add_format({'bold': True, 'bg_color': '#D6E4F0', 'border': 1}),
+        'section':      wb.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1}),
+
+        # ── Status / alert ────────────────────────────────────────────────────
+        'alert':        wb.add_format({'bold': True, 'font_size': 12,
+                                       'bg_color': '#C00000', 'font_color': 'white'}),
+        'warn':         wb.add_format({'bold': True, 'font_size': 12,
+                                       'bg_color': '#ED7D31', 'font_color': 'white'}),
+        'info':         wb.add_format({'bold': True, 'font_size': 12,
+                                       'bg_color': '#375623', 'font_color': 'white'}),
+
+        # ── Text / label ──────────────────────────────────────────────────────
+        'bold':         wb.add_format({'bold': True}),
+        'note':         wb.add_format({'italic': True, 'font_color': '#595959'}),
+        'note_sm':      wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9}),
+        'note_amber':   wb.add_format({'italic': True, 'font_color': '#7F6000', 'font_size': 8,
+                                       'bg_color': '#FFFFE0', 'border': 1, 'text_wrap': True}),
+        'link':         wb.add_format({'font_color': 'blue', 'underline': True}),
+
+        # ── Trend colours ─────────────────────────────────────────────────────
+        'up':           wb.add_format({'font_color': '#C00000', 'bold': True}),   # worse
+        'down':         wb.add_format({'font_color': '#375623', 'bold': True}),   # better
+        'same':         wb.add_format({'font_color': '#595959'}),
+
+        # ── Row highlight ─────────────────────────────────────────────────────
+        'row_red':      wb.add_format({'bg_color': '#FCE4D6'}),
+        'row_green':    wb.add_format({'bg_color': '#E2EFDA'}),
+        'row_amber':    wb.add_format({'bg_color': '#FFF2CC'}),
+        'row_blue':     wb.add_format({'bg_color': '#DEEAF1'}),
+        'row_pink':     wb.add_format({'bg_color': '#F2CEEF'}),
+        'row_teal':     wb.add_format({'bg_color': '#D9F0F4'}),   # teal — patch installing
+        'row_missing':  wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}),
+
+        # ── Health / score ────────────────────────────────────────────────────
+        'score_good':   wb.add_format({'bold': True, 'font_size': 18, 'font_color': '#375623'}),
+        'score_warn':   wb.add_format({'bold': True, 'font_size': 18, 'font_color': '#7F6000'}),
+        'score_bad':    wb.add_format({'bold': True, 'font_size': 18, 'font_color': '#9C0006'}),
+    }
+
 def _write_cve_links(ws, vuln_name_series, col_idx, link_fmt):
     """
     Overwrite the Vulnerability Name column cells with proper CVE.org hyperlinks.
@@ -517,35 +581,56 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(row_r, 4, f'Resolution Status (Score {threshold}+)', header_fmt)
     sub_grey = workbook.add_format({'font_color': '#595959', 'indent': 1})
     note_fmt_small = workbook.add_format({'font_color': '#595959', 'italic': True, 'font_size': 9})
+    # Compute unique pair counts directly from triage_df and patch data.
+    # COUNTIF across product sheets inflates counts when one CVE affects
+    # multiple products on the same device (it appears in each product sheet
+    # and is counted once per sheet, not once per unique device-CVE pair).
+    # Using the pre-computed sets gives the correct deduplicated totals.
+    from data_pipeline import normalize_device_name, extract_cve_id
+    triage_pairs_set = set(zip(
+        triage_df['Name'].apply(normalize_device_name),
+        triage_df['Vulnerability Name'].apply(extract_cve_id),
+    ))
+    n_total    = len(triage_pairs_set)
+    # patch_confirmed_count is already deduplicated (intersection with triage)
+    n_resolved = patch_confirmed_count  # patch-confirmed ☑ (unique pairs)
+    n_unres    = n_total - n_resolved
+
+    # Keep COUNTIF formula for live user editing feedback (shown alongside)
     if product_to_sheet:
         f_res   = ' + '.join([f"COUNTIF('{s}'!A:A, \"☑\")" for s in product_to_sheet.values()])
         f_unres = ' + '.join([f"COUNTIF('{s}'!A:A, \"☐\")" for s in product_to_sheet.values()])
     else:
         f_res, f_unres = '0', '0'
 
-    ws.write(row_r + 1, 4, 'Resolved (☑)');               ws.write_formula(row_r + 1, 5, f'={f_res}')
-    ws.write(row_r + 2, 4, 'Unresolved (☐)');             ws.write_formula(row_r + 2, 5, f'={f_unres}')
-    ws.write(row_r + 3, 4, 'Total (device × CVE pairs)'); ws.write_formula(row_r + 3, 5, f'={f_res} + {f_unres}')
+    ws.write(row_r + 1, 4, 'Resolved (☑)');
+    ws.write(row_r + 1, 5, n_resolved)
+    ws.write(row_r + 1, 6, 'patch-confirmed unique device × CVE pairs', note_fmt_small)
+    ws.write(row_r + 2, 4, 'Unresolved (☐)');
+    ws.write(row_r + 2, 5, n_unres)
+    ws.write(row_r + 3, 4, 'Total (device × CVE pairs)');
+    ws.write(row_r + 3, 5, n_total)
     ws.write(row_r + 3, 6, f'— {triage_df["Name"].nunique()} unique devices,  '
                             f'{triage_df["Vulnerability Name"].nunique()} unique CVE types', note_fmt_small)
+    # Live checkbox tally (may count cross-product duplicates — use as tracking aid)
+    if product_to_sheet:
+        ws.write(row_r + 4, 4, '   ☑ ticked in sheets', sub_grey)
+        ws.write_formula(row_r + 4, 5, f'={f_res}')
+        ws.write(row_r + 4, 6, 'incl. cross-product duplicates — use Total above for reporting', note_fmt_small)
 
-    extra_rows = 3   # rows used so far (resolved, unresolved, total)
+    extra_rows = 4   # rows used so far
     if patch_confirmed_count > 0:
-        ws.write(row_r + 4, 4, '── Resolved breakdown ──', sub_grey)
-        ws.write(row_r + 5, 4, '  Patch via RMM', sub_grey)
-        ws.write(row_r + 5, 5, patch_confirmed_count)
-        ws.write(row_r + 5, 6, 'pre-filled ☑ by patch report', note_fmt_small)
-        extra_rows = 5
+        ws.write(row_r + 5, 4, '── Resolved breakdown ──', sub_grey)
+        ws.write(row_r + 6, 4, '  Patch via RMM', sub_grey)
+        ws.write(row_r + 6, 5, patch_confirmed_count)
+        ws.write(row_r + 6, 6, 'pre-filled ☑ by patch report', note_fmt_small)
+        extra_rows = 6
 
         if has_prev_report:
-            # Only meaningful when a previous workbook exists — users could have
-            # manually ticked ☑ boxes in that run which carry forward.
-            # On a first run every ☑ is patch-confirmed; the "Manually Marked"
-            # subtraction would always read 0 and would be misleading.
-            ws.write(row_r + 6, 4, '  Manually Marked', sub_grey)
-            ws.write_formula(row_r + 6, 5, f'={f_res} - {patch_confirmed_count}')
-            ws.write(row_r + 6, 6, 'user-checked ☑', note_fmt_small)
-            extra_rows = 6
+            ws.write(row_r + 7, 4, '  Manually Marked', sub_grey)
+            ws.write_formula(row_r + 7, 5, f'={f_res} - {patch_confirmed_count}')
+            ws.write(row_r + 7, 6, 'user-checked ☑', note_fmt_small)
+            extra_rows = 7
 
     if redetected_count > 0:
         rr = row_r + extra_rows + 1
@@ -668,17 +753,20 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         wb_ = writer.book
         ws.autofilter(0, 0, len(group), len(final_cols) - 1)
 
-        # Row formats — one per gap category + resolved + exploit
-        patch_res_fmt     = wb_.add_format({'bg_color': '#DEEAF1'})  # blue   — patch via RMM
-        exploit_fmt       = wb_.add_format({'bg_color': '#FFE0CC'})  # orange — known exploit
-        coverage_fmt      = wb_.add_format({'bg_color': '#FFF2CC'})  # yellow — coverage_gap
-        unmanaged_fmt     = wb_.add_format({'bg_color': '#FCE4D6'})  # peach  — unmanaged_app
-        mismatch_fmt      = wb_.add_format({'bg_color': '#F2CEEF'})  # pink   — detection_mismatch
+        # Row formats — use style registry to avoid per-sheet format recreation
+        styles_           = get_workbook_styles(wb_)
+        patch_res_fmt     = styles_['row_blue']
+        exploit_fmt       = wb_.add_format({'bg_color': '#FFE0CC'})  # orange — no registry entry
+        coverage_fmt      = styles_['row_amber']
+        unmanaged_fmt     = styles_['row_red']
+        mismatch_fmt      = styles_['row_pink']
+        installing_fmt    = styles_['row_teal']
 
         _GAP_FMTS = {
             'coverage_gap':        coverage_fmt,
             'unmanaged_app':       unmanaged_fmt,
             'detection_mismatch':  mismatch_fmt,
+            'patch_installing':    installing_fmt,
         }
 
         cl = final_cols
@@ -726,6 +814,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ('#FFF2CC', 'yellow row', 'Coverage gap — device not in patch report'),
             ('#FCE4D6', 'peach row',  'Unmanaged app — product not tracked in patch report'),
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
+            ('#D9F0F4', 'teal row',   'Patch installing — patch is in progress, re-check after next RMM sync'),
             ('#FFFFFF', 'white row',  'Unresolved — patch available but not yet applied'),
         ]
         # Baseline note below legend
