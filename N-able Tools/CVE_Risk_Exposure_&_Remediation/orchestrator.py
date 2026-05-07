@@ -290,7 +290,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         # filtered_df  = evidence/history scope (RESOLVED + UNRESOLVED)
         #                → used by Raw Data, All Detections, patch evidence
         # active_df    = triage scope (UNRESOLVED only)
-        #                → used by Overview, Product sheets, New This Month,
+        #                → used by Overview, Product sheets, New Device-CVE Pairs,
         #                  Persisting CVEs, exposure counts
         # N-able exports the column as 'Threat Status' in direct exports and
         # 'Status' in some views — check both so we never silently skip the filter.
@@ -324,7 +324,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         overview_sheet_name = datetime.now().strftime('%B') + ' Detections'
         reserved = {
             'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
-            'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
+            'stale excluded devices', 'new device-cve pairs', 'new cve types',
+            'resolved', 'persisting cves',
             'patch match overview', 'patch match full data', 'patch report (full)',
             'patch confirmed', 'resolved (patch confirmed)',
         }
@@ -355,8 +356,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                                               inventory_devices=inventory_set)
             m = trend_data['metrics']
             log.info(
-                "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
-                m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
+                "Trend: %d new CVE types, %d new pairs, %d resolved, %d persisting (common-product scope)",
+                m['new_cve_count'], m.get('new_pair_count', 0),
+                m['resolved_cve_count'], m['persisting_cve_count'],
             )
 
         # ── Customer name ─────────────────────────────────────────────────────
@@ -501,7 +503,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'New This Month', 'Persisting CVEs'})
+                                          sheets_subset={'New Device-CVE Pairs', 'New CVE Types', 'Persisting CVEs'})
 
             build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                                   patch_resolved_pairs=patch_resolved_pairs,

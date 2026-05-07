@@ -166,31 +166,77 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
         ws.write(r, 2, f'{cur:,}')
         ws.write(r, 3, ch_str, ch_fmt)
 
-    row += 1; ws.merge_range(row, 0, row, 3, f'  Snapshot  (score ≥ {threshold})', sect_fmt)
-    row += 1; write_row(row, 'Unique CVEs (vulnerability types)', m['prev_cves'],    m['cur_cves'])
-    row += 1; write_row(row, 'Unique devices affected',           m['prev_devices'], m['cur_devices'])
-    # 'Unique CVE-device pairs' removed — metric causes more confusion than value
-    row += 1; write_row(row, 'CVEs with known exploit',           m['prev_exploit'], m['cur_exploit'])
-    row += 1; write_row(row, 'CISA KEV CVEs',                     m['prev_kev'],     m['cur_kev'])
-    row += 1; write_row(row, 'Servers affected',                  m['prev_servers'], m['cur_servers'])
+    row += 1; ws.merge_range(row, 0, row, 3,
+                              f'  Snapshot  (score ≥ {threshold}, UNRESOLVED only, all current products)',
+                              sect_fmt)
+    row += 1; write_row(row, 'Unique active CVEs — all current products', m['prev_cves'],    m['cur_cves'])
+    row += 1; write_row(row, 'Unique devices affected',                   m['prev_devices'], m['cur_devices'])
+    row += 1; write_row(row, 'CVEs with known exploit',                   m['prev_exploit'], m['cur_exploit'])
+    row += 1; write_row(row, 'CISA KEV CVEs',                             m['prev_kev'],     m['cur_kev'])
+    row += 1; write_row(row, 'Servers affected',                          m['prev_servers'], m['cur_servers'])
 
-    row += 2; ws.merge_range(row, 0, row, 3, '  CVE Movement  (unique CVE types)', sect_fmt)
+    # ── Comparable-scope clarification row ───────────────────────────────────
+    # The movement numbers below use the common-product scope (products present
+    # in BOTH reports). This row makes that difference visible so readers know
+    # why "all products" and "comparable scope" totals differ.
+    scoped_cur  = m.get('scoped_cur_cves',  m['cur_cves'])
+    scoped_prev = m.get('scoped_prev_cves', m['prev_cves'])
+    if scoped_cur != m['cur_cves'] or scoped_prev != m['prev_cves']:
+        row += 1
+        note_scope_fmt = workbook.add_format({'italic': True, 'font_color': '#7F6000', 'font_size': 9})
+        ws.write(row, 0,
+                 f'  ℹ  Comparable scope (products in both reports): '
+                 f'prev = {scoped_prev:,} CVE types,  this = {scoped_cur:,} CVE types  '
+                 f'— movement counts below use this scope.',
+                 note_scope_fmt)
+
+    row += 2; ws.merge_range(row, 0, row, 3,
+                              '  CVE Movement  (comparable scope — products in both reports)',
+                              sect_fmt)
     nc, rc, pc = m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count']
+    np_, rp, pp = (m.get('new_pair_count', nc),
+                   m.get('resolved_pair_count', rc),
+                   m.get('persisting_pair_count', pc))
+
+    sub_fmt2 = workbook.add_format({'bold': True, 'bg_color': '#EBF3FB', 'font_size': 9})
+    row += 1; ws.write(row, 0, 'CVE types view  (executive risk — unique vulnerability types)', sub_fmt2)
     row += 1
-    ws.write(row, 0, 'New CVE types introduced', lbl_fmt)
+    ws.write(row, 0, '  New CVE types introduced', lbl_fmt)
     ws.write(row, 2, f'{nc:,}')
     ws.write(row, 3, f'  ▲  {nc:,}' if nc else '  —  none', up_fmt if nc else same_fmt)
     row += 1
-    ws.write(row, 0, 'CVE types resolved / no longer detected', lbl_fmt)
+    ws.write(row, 0, '  CVE types resolved / no longer detected', lbl_fmt)
     ws.write(row, 2, f'{rc:,}')
     ws.write(row, 3, f'  ▼  {rc:,}' if rc else '  —  none', down_fmt if rc else same_fmt)
     row += 1
-    ws.write(row, 0, 'CVE types persisting from last period', lbl_fmt)
+    ws.write(row, 0, '  CVE types persisting from last period', lbl_fmt)
     ws.write(row, 2, f'{pc:,}')
     ws.write(row, 3, '  (see Persisting CVEs sheet)', same_fmt)
     row += 1
     note_fmt = workbook.add_format({'font_color': '#595959', 'italic': True})
-    ws.write(row, 0, f'  ✓  {nc} + {pc} = {nc+pc} unique CVEs this report  |  {rc} + {pc} = {rc+pc} unique CVEs previous', note_fmt)
+    ws.write(row, 0,
+             f'  ✓  {nc} new + {pc} persisting = {nc+pc} CVE types this scope  |  '
+             f'{rc} resolved + {pc} persisting = {rc+pc} CVE types previous scope',
+             note_fmt)
+
+    row += 1; ws.write(row, 0, 'Device-CVE pairs view  (patching workload — unique device × CVE pairs)', sub_fmt2)
+    row += 1
+    ws.write(row, 0, '  New device-CVE pairs', lbl_fmt)
+    ws.write(row, 2, f'{np_:,}')
+    ws.write(row, 3, f'  ▲  {np_:,}' if np_ else '  —  none', up_fmt if np_ else same_fmt)
+    row += 1
+    ws.write(row, 0, '  Resolved device-CVE pairs', lbl_fmt)
+    ws.write(row, 2, f'{rp:,}')
+    ws.write(row, 3, f'  ▼  {rp:,}' if rp else '  —  none', down_fmt if rp else same_fmt)
+    row += 1
+    ws.write(row, 0, '  Persisting device-CVE pairs', lbl_fmt)
+    ws.write(row, 2, f'{pp:,}')
+    ws.write(row, 3, '  (see Persisting CVEs sheet)', same_fmt)
+    row += 1
+    ws.write(row, 0,
+             f'  ℹ  Pairs > CVE types when one CVE spreads to multiple devices. '
+             f'Pairs < CVE types when a CVE is resolved on some devices but not all.',
+             note_fmt)
 
     row += 2; ws.merge_range(row, 0, row, 3, '  Device Movement', sect_fmt)
     row += 1
@@ -259,16 +305,18 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
                  note_fmt2)
 
     row += 2; ws.merge_range(row, 0, row, 3, '  Detail Sheets in This Workbook', sect_fmt)
-    row += 1; ws.write(row, 0, f'  📋  New This Month    →  {m["new_cve_count"]} new CVE types × all affected devices')
-    row += 1; ws.write(row, 0, f'  ✅  Resolved          →  {m["resolved_cve_count"]} CVE types resolved (no longer detected or all devices ☑)')
-    row += 1; ws.write(row, 0, f'  ⏳  Persisting CVEs   →  {m["persisting_cve_count"]} CVE types carried over from previous report')
+    row += 1; ws.write(row, 0, f'  📋  New Device-CVE Pairs  →  {np_:,} device/CVE pairs not present in previous report  (patching workload)')
+    row += 1; ws.write(row, 0, f'  🆕  New CVE Types         →  {nc:,} CVE types not present in previous report at all  (executive risk)')
+    row += 1; ws.write(row, 0, f'  ✅  Resolved              →  {rc:,} CVE types resolved (no longer detected or all devices ☑)')
+    row += 1; ws.write(row, 0, f'  ⏳  Persisting CVEs       →  {pc:,} CVE types carried over from previous report')
 
 
 # ── Trend Detail Sheets ───────────────────────────────────────────────────────
 
 def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=None):
     """
-    Write trend detail sheets: New This Month / Resolved / Persisting CVEs.
+    Write trend detail sheets:
+      New Device-CVE Pairs / New CVE Types / Resolved / Persisting CVEs.
     sheets_subset: if given, only write sheets whose names are in this set.
     """
     new_bg  = workbook.add_format({'bg_color': '#FCE4D6'})  # orange – new
@@ -280,18 +328,42 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
                    'Has Known Exploit', 'CISA KEV', 'Last Response']
 
     all_sheets = [
-        ('New This Month',  trend['new_df'],        new_bg,
-         'New CVEs not seen in the previous report — investigate and prioritise.'),
-        ('Resolved (Patch Confirmed)',        trend['resolved_df'],   res_bg,
-         'CVEs present last report that are no longer detected — confirmed remediated.'),
-        ('Persisting CVEs', trend['persisting_df'], per_bg,
-         'CVEs carried over from the previous report — still unresolved.'),
+        (
+            'New Device-CVE Pairs',
+            trend.get('new_pairs_df', trend.get('new_df', pd.DataFrame())),
+            new_bg,
+            'Device/CVE pairs not present in the previous report — new patching workload this period.',
+        ),
+        (
+            'New CVE Types',
+            trend.get('new_cve_types_df', pd.DataFrame()),
+            new_bg,
+            'CVE types not present in the previous report at all — new vulnerability types introduced this period.',
+        ),
+        (
+            'Resolved (Patch Confirmed)',
+            trend['resolved_df'],
+            res_bg,
+            'CVEs present last report that are no longer detected — confirmed remediated.',
+        ),
+        (
+            'Persisting CVEs',
+            trend['persisting_df'],
+            per_bg,
+            'CVEs carried over from the previous report — still unresolved.',
+        ),
     ]
+
+    # Back-compat: callers that still pass 'New This Month' in sheets_subset
+    # should receive the renamed sheet instead.
+    _compat_map = {'New This Month': 'New Device-CVE Pairs'}
+    if sheets_subset:
+        sheets_subset = {_compat_map.get(s, s) for s in sheets_subset}
 
     for sheet_name, df, row_fmt, note in all_sheets:
         if sheets_subset and sheet_name not in sheets_subset:
             continue
-        if df.empty:
+        if df is None or df.empty:
             ws = workbook.add_worksheet(sheet_name)
             ws.write(0, 0, f'No records — {note}')
             continue
