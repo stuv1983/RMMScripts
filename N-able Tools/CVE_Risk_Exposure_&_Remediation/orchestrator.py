@@ -82,11 +82,11 @@ class DashboardRequest:
     include_failure_report: bool         = False
     prev_report_path:     Optional[str]  = None
     include_trend:        bool           = False
-    threshold:            float          = 9.0
+    threshold:            float          = 1.0
     cutoff_date:          Optional[str]  = None
     show_all_dates:       bool           = False
     sync_baselines:       bool           = False
-    exclude_missing_rmm:  bool           = True
+    exclude_missing_rmm:  bool           = False
 
 
 @dataclass
@@ -308,11 +308,16 @@ def run(request: DashboardRequest) -> DashboardResult:
                         "RESOLVED detections will NOT be excluded from triage sheets.")
             active_df = filtered_df.copy()
 
-        triage_df = active_df[active_df['Last Response'] != 'Not Found in RMM'].copy()
+        # triage_df = active_df: ALL unresolved detections go into product sheets
+        # and the overview, regardless of whether the device is in the RMM export.
+        # If a device is missing from the RMM file its Last Response will read
+        # 'Not Found in RMM' — that is surfaced in the sheet so the analyst can
+        # investigate, but the CVE must not be silently dropped.
+        triage_df = active_df.copy()
 
         not_in_rmm = active_df[active_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
         if not_in_rmm:
-            w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — excluded from triage sheets"
+            w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — shown in report with 'Not Found in RMM' status"
             log.warning(w)
             warnings.append(w)
 
@@ -352,7 +357,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
-            trend_data       = compute_trends(merged_df, prev_df, request.threshold,
+            trend_data       = compute_trends(active_df, prev_df, request.threshold,
                                               inventory_devices=inventory_set)
             m = trend_data['metrics']
             log.info(

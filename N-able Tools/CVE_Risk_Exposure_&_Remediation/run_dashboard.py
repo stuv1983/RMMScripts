@@ -66,16 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Patch failure report CSV for failed patch delivery analysis')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
-    p.add_argument('--threshold', default=9.0,    type=float, metavar='SCORE',
-                   help='Minimum CVE score to include (default: 9.0)')
+    p.add_argument('--threshold', default=1.0,    type=float, metavar='SCORE',
+                   help='Minimum CVE CVSS score to include (default: 1.0 — include all)')
     p.add_argument('--since',     default=None,   metavar='YYYY-MM-DD',
                    help='Only include detections on or after this date')
     p.add_argument('--all-dates', action='store_true',
                    help='Include all detection dates (overrides --since)')
     p.add_argument('--sync-baselines', action='store_true',
                    help='Refresh rolling product baselines from vendor APIs before generating')
-    p.add_argument('--include-all-rmm', action='store_true',
-                   help='Keep CVEs for devices not in RMM inventory (default: exclude them)')
+    p.add_argument('--exclude-missing-rmm', action='store_true',
+                   help='Drop CVEs for devices not found in the RMM inventory (default: keep them)')
     p.add_argument('--verbose',   action='store_true',
                    help='Enable DEBUG-level logging')
     return p
@@ -121,7 +121,7 @@ def main() -> int:
         cutoff_date            = None if args.all_dates else args.since,
         show_all_dates         = args.all_dates,
         sync_baselines         = args.sync_baselines,
-        exclude_missing_rmm    = not args.include_all_rmm,
+        exclude_missing_rmm    = args.exclude_missing_rmm,
     )
 
     log.info("Starting headless dashboard generation")

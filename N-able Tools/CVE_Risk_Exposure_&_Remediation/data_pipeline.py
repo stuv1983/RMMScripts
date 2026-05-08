@@ -1183,12 +1183,20 @@ def compute_trends(current_df, previous_df, threshold,
     snap_cur_servers  = _srv_count(cur_t)
 
     # ── Step 3: Common-product scope ─────────────────────────────────────────
-    # Restrict movement maths to products present in BOTH reports so newly-
-    # onboarded products don't inflate "new" counts.
+    # For PERSISTING and RESOLVED movement, restrict to products present in
+    # BOTH reports — apples-to-apples comparison only.
+    # For NEW detections, use the FULL cur_t so genuinely new products (e.g.
+    # Office appearing for the first time this month) are not silently dropped.
     common_products = (set(cur_t['Base Product'].unique())
                        & set(prev_t['Base Product'].unique()))
+    new_products    = set(cur_t['Base Product'].unique()) - set(prev_t['Base Product'].unique())
+
     cur_scoped  = cur_t[cur_t['Base Product'].isin(common_products)].copy()
     prev_scoped = prev_t[prev_t['Base Product'].isin(common_products)].copy()
+
+    if new_products:
+        log.info("Trend: %d product(s) new this period (not in previous report): %s",
+                 len(new_products), sorted(new_products))
 
     # ── Step 4: Checkbox-resolved pairs removed from cur_scoped only ─────────
     checkbox_resolved = set()
@@ -1205,43 +1213,49 @@ def compute_trends(current_df, previous_df, threshold,
     # ── Step 5: Dual set arithmetic — pairs AND CVE types ────────────────────
     #
     # PAIR-LEVEL  (device × CVE × product triple)
-    #   new_pairs      = in cur, not in prev  → actual patching workload added
-    #   resolved_pairs = in prev, not in cur  → work completed
-    #   persisting_pairs = in both             → backlog
+    #   new_pairs      = in cur_t (ALL products), not in prev  → patching workload added
+    #   resolved_pairs = in prev, not in cur_scoped            → work completed
+    #   persisting_pairs = in cur_scoped AND prev              → backlog (common products)
     #
     # CVE-TYPE-LEVEL  (CVE ID only)
-    #   new_cve_ids      = CVEs not present at all last period  → executive risk view
-    #   resolved_cve_ids = CVEs gone from cur entirely          → remediation signal
-    #   persisting_cve_ids = CVEs still present in cur AND prev
+    #   new_cve_ids      = CVEs in cur_t not in prev at all    → executive risk view
+    #   resolved_cve_ids = CVEs gone from cur entirely         → remediation signal
+    #   persisting_cve_ids = CVEs in cur_scoped AND prev
     #
-    # The two views will differ whenever one CVE spreads to new devices (pair
-    # count rises but CVE type is NOT new) or when a CVE is resolved on some
-    # devices but not all (pair count falls but CVE type persists).
+    # Using cur_t (not cur_scoped) for "new" ensures genuinely new products
+    # (e.g. Office first appearing this month) are captured in the New sheets
+    # rather than silently excluded by the common-product filter.
+    # Persisting and Resolved still use the common-product scope for
+    # apples-to-apples comparison.
 
-    cur_pair_keys  = set(zip(cur_scoped['_Name_Key'],
-                             cur_scoped['_CVE_Key'],
-                             cur_scoped['_Product_Key']))
-    prev_pair_keys = set(zip(prev_scoped['_Name_Key'],
-                              prev_scoped['_CVE_Key'],
-                              prev_scoped['_Product_Key']))
+    cur_all_pair_keys  = set(zip(cur_t['_Name_Key'],
+                                  cur_t['_CVE_Key'],
+                                  cur_t['_Product_Key']))
+    cur_scoped_pair_keys = set(zip(cur_scoped['_Name_Key'],
+                                    cur_scoped['_CVE_Key'],
+                                    cur_scoped['_Product_Key']))
+    prev_pair_keys     = set(zip(prev_scoped['_Name_Key'],
+                                  prev_scoped['_CVE_Key'],
+                                  prev_scoped['_Product_Key']))
 
-    new_pair_keys        = cur_pair_keys  - prev_pair_keys
-    resolved_pair_keys   = prev_pair_keys - cur_pair_keys
-    persisting_pair_keys = cur_pair_keys  & prev_pair_keys
+    new_pair_keys        = cur_all_pair_keys  - prev_pair_keys
+    resolved_pair_keys   = prev_pair_keys     - cur_scoped_pair_keys
+    persisting_pair_keys = cur_scoped_pair_keys & prev_pair_keys
 
     def _filter_pairs(df, keys):
         mask = [k in keys for k in zip(df['_Name_Key'], df['_CVE_Key'], df['_Product_Key'])]
         return _drop_internal(df[mask].copy())
 
-    new_pairs_df      = _filter_pairs(cur_scoped,  new_pair_keys).sort_values('Vulnerability Score', ascending=False)
-    resolved_df       = _filter_pairs(prev_scoped, resolved_pair_keys).sort_values('Vulnerability Score', ascending=False)
-    persisting_df     = _filter_pairs(cur_scoped,  persisting_pair_keys).sort_values('Vulnerability Score', ascending=False)
+    new_pairs_df      = _filter_pairs(cur_t,       new_pair_keys).sort_values('Vulnerability Score', ascending=False)
+    resolved_df       = _filter_pairs(prev_scoped,  resolved_pair_keys).sort_values('Vulnerability Score', ascending=False)
+    persisting_df     = _filter_pairs(cur_scoped,   persisting_pair_keys).sort_values('Vulnerability Score', ascending=False)
 
-    # CVE-type sets
-    cur_cve_ids  = set(cur_scoped['_CVE_Key'].unique())
-    prev_cve_ids = set(prev_scoped['_CVE_Key'].unique())
+    # CVE-type sets — "new" uses all of cur_t, persisting/resolved use scoped
+    cur_all_cve_ids  = set(cur_t['_CVE_Key'].unique())
+    cur_cve_ids      = set(cur_scoped['_CVE_Key'].unique())
+    prev_cve_ids     = set(prev_scoped['_CVE_Key'].unique())
 
-    new_cve_ids          = cur_cve_ids - prev_cve_ids
+    new_cve_ids          = cur_all_cve_ids - prev_cve_ids
     scanner_resolved_cves = prev_cve_ids - cur_cve_ids
 
     # A CVE type is also resolved if EVERY previous occurrence was checkbox-resolved
@@ -1255,17 +1269,18 @@ def compute_trends(current_df, previous_df, threshold,
     resolved_cve_ids   = scanner_resolved_cves | checkbox_resolved_cves
     persisting_cve_ids = cur_cve_ids & (prev_cve_ids - resolved_cve_ids)
 
-    # new_cve_types_df: one representative row per truly-new CVE type
-    # (all devices that have it this period, for full context)
+    # new_cve_types_df: all devices affected by truly-new CVE types this period
+    # Uses cur_t (not cur_scoped) so new products like Office are included
     new_cve_types_df = _drop_internal(
-        cur_scoped[cur_scoped['_CVE_Key'].isin(new_cve_ids)].copy()
+        cur_t[cur_t['_CVE_Key'].isin(new_cve_ids)].copy()
     ).sort_values('Vulnerability Score', ascending=False)
 
-    cur_dev_set  = set(cur_scoped['_Name_Key'].unique())
-    prev_dev_set = set(prev_scoped['_Name_Key'].unique())
+    # Device movement uses full cur_t vs prev_t for honest device counts
+    cur_dev_set  = set(cur_t['_Name_Key'].unique())
+    prev_dev_set = set(prev_t['_Name_Key'].unique())
 
     # Scoped CVE counts (comparable scope only — for Trend Summary clarity rows)
-    scoped_cur_cves  = len(cur_cve_ids)
+    scoped_cur_cves  = len(cur_all_cve_ids)
     scoped_prev_cves = len(prev_cve_ids)
 
     metrics = {

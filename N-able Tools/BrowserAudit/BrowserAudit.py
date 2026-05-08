@@ -154,6 +154,61 @@ def parse_browsers(output):
         })
     return results
 
+
+# ── Firefox last-used parsing ─────────────────────────────────────────────────
+# Matches lines in the "Firefox Usage Report" section produced by Get-FirefoxLastUsed.
+# Expected line format (tab or multi-space separated):
+#   <UserName>   <ProfileDirName>   <YYYY-MM-DD HH:MM:SS>
+# The datetime is captured loosely so minor PS formatting differences don't break it.
+_FF_USED_PAT = re.compile(
+    r"^[ \t]*(\S+)"                       # Windows username (no spaces)
+    r"[ \t]+"
+    r"(\S+)"                              # Firefox profile dir name
+    r"[ \t]+"
+    r"(\d{1,2}/\d{1,2}/\d{4}"            # date variants:  M/D/YYYY
+    r"|\d{4}-\d{2}-\d{2}"                #                 YYYY-MM-DD
+    r"|\d{1,2}\s+\w+\s+\d{4})"          #                 D Month YYYY
+    r"[ \t]+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)",  # time, optional seconds/AM-PM
+    re.MULTILINE | re.IGNORECASE,
+)
+
+def parse_firefox_last_used(output):
+    """
+    Extract Firefox last-used records from a PS script output string.
+    Returns a list of dicts: {user, profile, last_used_raw, last_used_dt}.
+    Only the block after 'Firefox Usage Report:' is searched so that
+    the browser-install table above it doesn't produce false matches.
+    """
+    text = str(output).replace("\r\n", "\n").replace("\r", "\n").replace(";", "\n")
+
+    # Narrow to the Firefox Usage Report section if the marker is present
+    marker_idx = text.lower().find("firefox usage report")
+    if marker_idx != -1:
+        text = text[marker_idx:]
+
+    results = []
+    for m in _FF_USED_PAT.finditer(text):
+        raw_dt = f"{m.group(3)} {m.group(4)}".strip()
+        dt = None
+        for fmt in ("%d/%m/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M %p",
+                    "%d/%m/%Y %H:%M:%S",    "%d/%m/%Y %H:%M",
+                    "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p",
+                    "%m/%d/%Y %H:%M:%S",    "%m/%d/%Y %H:%M",
+                    "%Y-%m-%d %H:%M:%S",    "%Y-%m-%d %H:%M",
+                    "%d %B %Y %H:%M:%S",    "%d %B %Y %H:%M"):
+            try:
+                dt = datetime.strptime(raw_dt, fmt)
+                break
+            except ValueError:
+                continue
+        results.append({
+            "user":         m.group(1),
+            "profile":      m.group(2),
+            "last_used_raw": raw_dt,
+            "last_used_dt":  dt,
+        })
+    return results
+
 def _path_note(arch, path):
     """Return a plain-English note when a 64-bit binary lives in a (x86) folder.
     Edge always installs to Program Files (x86) regardless of bitness — without
@@ -289,7 +344,16 @@ def build_browser_sheet_rows(audit_active, inv_active, browser_name):
             if b["browser"] != browser_name:
                 continue
             is_per_user = b["scope"] == "Per-User" or "appdata" in b["path"].lower()
-            rows.append({
+
+            # For Firefox, pull the most-recent last-used date across all profiles on this device
+            ff_last_used = ""
+            if browser_name == "Mozilla Firefox":
+                ff_records = parse_firefox_last_used(str(row["Output"]))
+                valid_dts = [r["last_used_dt"] for r in ff_records if r["last_used_dt"]]
+                if valid_dts:
+                    ff_last_used = max(valid_dts).strftime("%d %b %Y  %H:%M")
+
+            entry = {
                 "Device":              device,
                 "Client":              inv["Customer name"]               if inv is not None and "Customer name"             in inv.index else row.get("Client", ""),
                 "Site":                inv["Site name"]                   if inv is not None and "Site name"                 in inv.index else row.get("Site", ""),
@@ -303,7 +367,10 @@ def build_browser_sheet_rows(audit_active, inv_active, browser_name):
                 "OS":                  inv["OS version"]                  if inv is not None else "N/A",
                 "Username":            inv["Username"]                    if inv is not None else "N/A",
                 "Last Response":       str(inv["Last response (Local time)"]) if inv is not None else "N/A",
-            })
+            }
+            if browser_name == "Mozilla Firefox":
+                entry["Last Used"] = ff_last_used
+            rows.append(entry)
     # Sort: by device name first so all installs for the same device sit together
     # (e.g. MEDTECH121 Firefox 32-bit and 64-bit are adjacent rows).
     # Within each device: risk rows (32-bit / per-user) before clean, then version desc.
@@ -375,8 +442,13 @@ def _write_browser_sheet(wb, browser_name, rows):
     cfg = BROWSER_SHEET_CONFIG[browser_name]
     short = browser_name.replace("Google ", "").replace("Mozilla ", "").replace("Microsoft ", "")
     ws = wb.create_sheet(f"{cfg['emoji']} {short}"); ws.sheet_view.showGridLines = False
-    hdrs = ["Device", "Client", "Site", "Version", "Architecture", "Install Scope",
-            "Install Path", "Is 32-bit", "Is Per-User/AppData", "Note", "OS", "Username", "Last Response"]
+
+    is_firefox = browser_name == "Mozilla Firefox"
+    hdrs = ["Device", "Version", "Architecture", "Install Scope",
+            "Install Path", "Is 32-bit", "Is Per-User/AppData", "Username", "Last Response"]
+    if is_firefox:
+        hdrs.append("Last Used")
+
     for c, h in enumerate(hdrs, 1): ws.cell(1, c, h)
     _hdr(ws, 1, len(hdrs), _fill(cfg["color"]))
     for r, rec in enumerate(rows, 2):
@@ -386,11 +458,69 @@ def _write_browser_sheet(wb, browser_name, rows):
             cell = ws.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
             cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
         ws.row_dimensions[r].height = 18
-    _widths(ws, [20, 14, 22, 18, 14, 16, 64, 10, 18, 44, 32, 24, 20])
+
+    if is_firefox:
+        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 24, 20, 22])
+    else:
+        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 24, 20])
     ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
     _write_legend(ws, len(rows) + 3, [
         (COL["row_risk"],  "Risk row — install is 32-bit or per-user/AppData. Review and remediate."),
         (COL["row_blue"],  "Clean row — 64-bit system install, no issues detected."),
+    ])
+
+
+def build_firefox_last_used_rows(audit_active):
+    """
+    Parse the Firefox Usage Report section from every device's Output field.
+    Returns a list of dicts ready to write to the sheet, sorted by last_used_dt desc.
+    """
+    rows = []
+    for _, row in audit_active.iterrows():
+        device = row["Device"]
+        for rec in parse_firefox_last_used(str(row["Output"])):
+            rows.append({
+                "Device":       device,
+                "Windows User": rec["user"],
+                "FF Profile":   rec["profile"],
+                "Last Used":    rec["last_used_dt"].strftime("%d %b %Y  %H:%M") if rec["last_used_dt"] else rec["last_used_raw"],
+                "_dt":          rec["last_used_dt"] or datetime.min,
+            })
+    rows.sort(key=lambda r: r["_dt"], reverse=True)
+    return rows
+
+
+def _write_firefox_last_used_sheet(wb, rows):
+    """Add a '🦊 Firefox Last Used' sheet to wb."""
+    ws = wb.create_sheet("🦊 Firefox Last Used")
+    ws.sheet_view.showGridLines = False
+
+    hdrs = ["Device", "Windows User", "FF Profile", "Last Used"]
+    for c, h in enumerate(hdrs, 1):
+        ws.cell(1, c, h)
+    _hdr(ws, 1, len(hdrs), _fill(COL["amber"]))
+
+    now = datetime.now()
+    for r, rec in enumerate(rows, 2):
+        dt = rec.get("_dt")
+        if dt and dt != datetime.min:
+            days_ago = (now - dt).days
+            row_fill = _fill(COL["row_gold2"]) if days_ago > 90 else _fill(COL["row_blue"])
+        else:
+            row_fill = _fill(COL["white"])
+
+        for c, key in enumerate(hdrs, 1):
+            cell = ws.cell(r, c, rec.get(key, ""))
+            cell.font = BODY_FONT; cell.border = BORDER
+            cell.fill = row_fill; cell.alignment = WRAP
+        ws.row_dimensions[r].height = 18
+
+    _widths(ws, [24, 20, 38, 22])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    _write_legend(ws, len(rows) + 3, [
+        (COL["row_blue"],  "Firefox used within the last 90 days."),
+        (COL["row_gold2"], "Firefox not used in over 90 days — consider reviewing."),
     ])
 
 
@@ -563,6 +693,11 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
     # ── Per-browser sheets ────────────────────────────────────────────────────
     for browser_name in BROWSERS_TRACKED:
         _write_browser_sheet(wb, browser_name, all_browser_rows[browser_name])
+
+    # ── Firefox Last Used sheet ───────────────────────────────────────────────
+    ff_last_used_rows = build_firefox_last_used_rows(audit_active)
+    if ff_last_used_rows:
+        _write_firefox_last_used_sheet(wb, ff_last_used_rows)
 
     ws3 = wb.create_sheet("🔍 Not Scanned (Active)"); ws3.sheet_view.showGridLines = False
     ns_h = ["Device Name", "Customer", "Site", "Device Type", "OS Version", "Username", "Last Response", "Manufacturer", "Model"]
@@ -848,6 +983,10 @@ class App(tk.Tk):
                 out_path, stale_days, client_name)
 
             all_rows_flat = [r for rows in all_browser_rows.values() for r in rows]
+            ff_last_used_count = sum(
+                len(parse_firefox_last_used(str(row["Output"])))
+                for _, row in audit_active.iterrows()
+            )
             self._log(f"\n✔  Saved to: {out_path}", "ok")
             self._log(f"   Issues found    : {n_f} devices / {len(flagged)} issue rows",  "warn" if n_f  else "ok")
             self._log(f"   Browser installs: {len(all_rows_flat)}", "dim")
@@ -859,6 +998,7 @@ class App(tk.Tk):
             self._log(f"   Per-user        : {n_per} devices", "warn" if n_per else "ok")
             self._log(f"   Not scanned     : {n_ns}", "warn" if n_ns else "ok")
             self._log(f"   Stale excluded  : {n_st}", "dim")
+            self._log(f"   FF last-used    : {ff_last_used_count} profile record(s)", "dim")
 
             self.after(0, lambda: self._offer_open(out_path))
 
