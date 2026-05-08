@@ -207,7 +207,7 @@ tk.Checkbutton(root, text="Skip RMM (CVE export includes device info)",
 score_frame = tk.Frame(root)
 score_frame.pack(anchor="w", padx=14, pady=(8, 0))
 tk.Label(score_frame, text="Minimum CVE Score:", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
-score_var = tk.StringVar(value="1.0")
+score_var = tk.StringVar(value="9.0")
 tk.Entry(score_frame, textvariable=score_var, width=6).pack(side=tk.LEFT, padx=6)
 
 date_frame = tk.Frame(root)
