@@ -66,16 +66,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Patch failure report CSV for failed patch delivery analysis')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
-    p.add_argument('--threshold', default=1.0,    type=float, metavar='SCORE',
-                   help='Minimum CVE CVSS score to include (default: 1.0 — include all)')
-    p.add_argument('--since',     default=None,   metavar='YYYY-MM-DD',
-                   help='Only include detections on or after this date')
+    p.add_argument('--threshold', default=9.0,    type=float, metavar='SCORE',
+                   help='Minimum CVE CVSS score to include (default: 9.0 — critical only)')
+    p.add_argument('--since',     default=None,   metavar='DD/MM/YYYY',
+                   help='Only include detections on or after this date (dd/mm/yyyy)')
     p.add_argument('--all-dates', action='store_true',
                    help='Include all detection dates (overrides --since)')
     p.add_argument('--sync-baselines', action='store_true',
                    help='Refresh rolling product baselines from vendor APIs before generating')
     p.add_argument('--exclude-missing-rmm', action='store_true',
                    help='Drop CVEs for devices not found in the RMM inventory (default: keep them)')
+    p.add_argument('--report-month', default='', metavar='MONTH',
+                   help='Report label e.g. "April 2026". Defaults to current month. '
+                        'Allows retroactive labelling when generating last month\'s report today.')
     p.add_argument('--verbose',   action='store_true',
                    help='Enable DEBUG-level logging')
     return p
@@ -122,6 +125,7 @@ def main() -> int:
         show_all_dates         = args.all_dates,
         sync_baselines         = args.sync_baselines,
         exclude_missing_rmm    = args.exclude_missing_rmm,
+        report_month           = args.report_month,
     )
 
     log.info("Starting headless dashboard generation")

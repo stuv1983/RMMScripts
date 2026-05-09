@@ -80,15 +80,18 @@ _RULES = [
     # (pmr_substring, resolved_value, vcr_substring, internal_cause)
     ("Not found in patch report",                  None,        None,               "coverage_gap"),
     ("Device in patch report - product not found", None,        None,               "unmanaged_app"),
-    (None,                                         "Patch confirmed - pending rescan",  None,               None),
+    (None,                                         "Patch confirmed - pending rescan", None,          None),
     ("Matched - installed",   "Unresolved", "Version compliant",    "version_compliant"),
     ("Matched - installed",   "Unresolved", "Below fixed version",  "version_below_fixed"),
     ("Matched - installed",   "Unresolved", "no fixed baseline",    "no_fixed_baseline"),
     ("Matched - installed",   "Unresolved", None,                   "no_version_data"),
-    ("Matched - installing",  None,         None,                   None),
-    ("Matched - pending",     None,         None,                   None),
-    ("Matched - missing",     None,         None,                   None),
-    ("Matched - failed",      None,         None,                   None),
+    # Fix: these statuses have defined DISPLAY_MAP entries and _PENALTIES weights —
+    # they must map to their cause codes so rows appear in root_cause_df and
+    # contribute to the health score instead of being silently dropped.
+    ("Matched - installing",  None,         None,                   "patch_installing"),
+    ("Matched - pending",     None,         None,                   "patch_pending"),
+    ("Matched - missing",     None,         None,                   "patch_missing"),
+    ("Matched - failed",      None,         None,                   "patch_missing"),
 ]
 
 def classify_baseline_root_cause(row) -> Optional[str]:

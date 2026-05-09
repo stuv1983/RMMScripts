@@ -40,11 +40,14 @@ def save(output_path: str,
          unique_cves: int,
          unique_devices: int,
          trend_metrics: Optional[dict] = None,
-         root_cause_summary: Optional[dict] = None) -> None:
+         root_cause_summary: Optional[dict] = None,
+         report_month: Optional[str] = None) -> None:
     """
     Persist a compact snapshot of this run.  Writes three files:
       - per-run timestamped JSON
-      - monthly aggregate JSON (overwritten with latest run each month)
+      - monthly aggregate JSON (keyed by report_month when provided, otherwise
+        by execution month — so a "April 2026" run done in May is stored under
+        2026-04, not 2026-05)
       - index.json (appended)
 
     All writes are wrapped in try/except — snapshot failure is non-fatal.
@@ -55,10 +58,21 @@ def save(output_path: str,
 
         now   = datetime.now()
         stamp = now.strftime('%Y-%m-%dT%H-%M')
-        month = now.strftime('%Y-%m')
+
+        # Use the user-supplied report_month label for the monthly aggregate key
+        # so retroactive runs ("generating April in May") land in the right bucket.
+        if report_month:
+            try:
+                _parsed = datetime.strptime(report_month.strip(), '%B %Y')
+                month   = _parsed.strftime('%Y-%m')
+            except ValueError:
+                month = now.strftime('%Y-%m')   # fallback to execution month
+        else:
+            month = now.strftime('%Y-%m')
 
         record: dict = {
             'run_date':          now.isoformat(timespec='seconds'),
+            'report_month':      report_month or month,
             'customer':          customer,
             'output_file':       Path(output_path).name,
             'threshold':         threshold,
@@ -100,6 +114,13 @@ def load_history(output_path: str, months: int = 12) -> list[dict]:
     Load up to `months` monthly snapshots from the snapshots directory.
     Returns a list of records sorted oldest-first, suitable for trend charts.
     Returns empty list if no snapshots exist.
+
+    Fix: the original year calculation used boolean subtraction
+    ``now.year - (now.month - 1 - i < 0)`` which only ever subtracted one year,
+    producing wrong keys for any window spanning more than 12 months or crossing
+    a year boundary more than once.  The correct formula uses Python's floor
+    division which handles arbitrary negative offsets:
+        yr = now.year + (now.month - 1 - i) // 12
     """
     snap_dir = _snap_dir(output_path)
     if not snap_dir.exists():
@@ -108,11 +129,11 @@ def load_history(output_path: str, months: int = 12) -> list[dict]:
     records: list[dict] = []
     now = datetime.now()
     for i in range(months - 1, -1, -1):
-        # Walk backwards month by month
-        yr  = now.year  - (now.month - 1 - i < 0)  # type: ignore[operator]
-        mo  = (now.month - 1 - i) % 12 + 1
-        key = f'{yr:04d}-{mo:02d}'
-        p   = snap_dir / f'{key}.json'
+        offset = now.month - 1 - i          # may be negative for earlier months
+        mo     = offset % 12 + 1            # always 1–12
+        yr     = now.year + offset // 12    # correct floor division for negative offsets
+        key    = f'{yr:04d}-{mo:02d}'
+        p      = snap_dir / f'{key}.json'
         if p.exists():
             rec = _read_json(p)
             if isinstance(rec, dict):

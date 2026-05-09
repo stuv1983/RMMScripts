@@ -899,9 +899,16 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     Applies the full pipeline in one place so every caller uses identical logic:
       • Score threshold
       • UNRESOLVED-only (status column named 'Threat Status' or 'Status')
+      • Not-in-RMM exclusion (devices with Last Response == 'Not Found in RMM'
+        have no confirmed identity in the managed estate and must not skew
+        New / Resolved / Persisting counts regardless of inventory_devices)
       • Inventory filter (decommissioned devices dropped)
       • Stale filter (stale devices dropped completely from trend comparison)
       • Deduplication on (_Name_Key, _CVE_Key, _Product_Key)
+
+    NOTE: normalize_device_name is applied to 'Name' before any set lookup, so
+    stale_names built in orchestrator.py must also use the same normaliser —
+    this is enforced there via .apply(normalize_device_name).
     """
     out = df.copy()
     out['_Name_Key']    = out['Name'].apply(normalize_device_name)
@@ -919,10 +926,18 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     if _sc:
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
 
-    # Exclude devices not present in RMM — they have no confirmed identity in the
-    # managed estate and must not skew New / Resolved / Persisting counts.
+    # Exclude devices that were not matched in the RMM inventory.
+    # These rows carry no confirmed device identity and would produce phantom
+    # New / Resolved signals if carried into set arithmetic.
+    # Guard on column presence: older previous-report exports may predate this
+    # column — log a debug note so the absence is traceable, then skip the filter.
     if 'Last Response' in out.columns:
         out = out[out['Last Response'].astype(str).str.strip() != 'Not Found in RMM'].copy()
+    else:
+        log.debug(
+            "_active_trend_scope: 'Last Response' column absent in DataFrame — "
+            "skipping Not-in-RMM filter (older report format)"
+        )
 
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()

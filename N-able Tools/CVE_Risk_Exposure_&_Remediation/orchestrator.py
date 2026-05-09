@@ -600,6 +600,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             unique_devices    = int(filtered_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
+            report_month      = report_month_val,
         )
 
         trend_summary = None
