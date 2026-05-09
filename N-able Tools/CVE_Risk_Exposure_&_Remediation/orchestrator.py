@@ -77,7 +77,7 @@ class DashboardRequest:
     cutoff_date:          Optional[str]  = None
     show_all_dates:       bool           = False
     sync_baselines:       bool           = False
-    exclude_missing_rmm:  bool           = True
+    exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
 
 
@@ -283,6 +283,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
                                 
+            # Capture the names of all stale excluded devices to purge them from the previous report
             stale_names = set(stale_excluded['Name'].apply(normalize_device_name)) if not stale_excluded.empty else set()
             
             trend_data       = compute_trends(merged_df, prev_df, request.threshold,
@@ -412,9 +413,9 @@ def run(request: DashboardRequest) -> DashboardResult:
             header_fmt = styles['header']
             miss_fmt   = styles['row_missing']
 
-            _not_in_rmm_cve_rows = int(
-                len(filtered_df[filtered_df['Last Response'] == 'Not Found in RMM'])
-            ) if 'Last Response' in filtered_df.columns else 0
+            _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
+            _not_in_rmm_cve_rows = int(_not_in_rmm_mask.sum()) if 'Last Response' in filtered_df.columns else 0
+            _not_in_rmm_unique_cves = int(filtered_df.loc[_not_in_rmm_mask, 'Vulnerability Name'].nunique()) if 'Last Response' in filtered_df.columns and 'Vulnerability Name' in filtered_df.columns else 0
 
             build_client_summary_sheet(
                 wb, triage_df,
@@ -424,6 +425,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
                 not_in_rmm_count=not_in_rmm,
                 not_in_rmm_cve_count=_not_in_rmm_cve_rows,
+                not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
                 report_month=report_month_val,
             )
 
@@ -458,6 +460,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             if not stale_excluded.empty:
                 build_stale_excluded_sheet(writer, stale_excluded)
                 
+                # Fetch unresolved CVEs for these stale devices natively from RAW DATA
                 stale_device_names = stale_excluded['Name'].unique()
                 stale_raw_rows = raw_df[raw_df['Name'].isin(stale_device_names)].copy()
                 

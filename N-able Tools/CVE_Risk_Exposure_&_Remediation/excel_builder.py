@@ -1114,6 +1114,7 @@ def build_stale_cves_sheet(writer, df, link_fmt) -> None:
 def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_name='',
                                cutoff_date=None, stale_excluded_df=None,
                                not_in_rmm_count=0, not_in_rmm_cve_count=0,
+                               not_in_rmm_unique_cves=0,
                                report_month=''):
     ws = workbook.add_worksheet('Client Summary')
     if not report_month:
@@ -1250,10 +1251,10 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
             row += 1
 
         if not_in_rmm_count > 0:
-            ws.write(row, 0, 'Device not found in RMM inventory', _amber_lbl)
-            ws.write(row, 1, not_in_rmm_count,     _amber_fmt)
-            ws.write(row, 2, not_in_rmm_cve_count, _amber_fmt)
-            ws.write(row, 3, '',                    _amber_fmt)
+            ws.write(row, 0, 'Device in Detections but no longer in RMM', _amber_lbl)
+            ws.write(row, 1, not_in_rmm_count,       _amber_fmt)
+            ws.write(row, 2, not_in_rmm_cve_count,   _amber_fmt)
+            ws.write(row, 3, not_in_rmm_unique_cves, _amber_fmt) # <--- Fixed! Now injects the correct unique CVE count
             row += 1
 
         ws.merge_range(row, 0, row, 3,
@@ -1340,7 +1341,6 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
              'ℹ  All metrics exclude devices not found in RMM and devices outside the '
              'active date window. CVSS 9.0+ detections are highlighted in red.',
              note_fmt)
-
 
     if score_split_data and len(score_split_data) >= 2:
 
