@@ -919,6 +919,11 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     if _sc:
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
 
+    # Exclude devices not present in RMM — they have no confirmed identity in the
+    # managed estate and must not skew New / Resolved / Persisting counts.
+    if 'Last Response' in out.columns:
+        out = out[out['Last Response'].astype(str).str.strip() != 'Not Found in RMM'].copy()
+
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()
 

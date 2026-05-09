@@ -13,7 +13,10 @@ Zero business logic. Zero data processing. Zero Excel writing.
 """
 
 import logging
+import subprocess
+import sys
 import threading
+from pathlib import Path
 from typing import Optional
 from datetime import date, timedelta, datetime
 
@@ -28,6 +31,169 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# THEME DEFINITIONS
+# ---------------------------------------------------------------------------
+_THEMES = {
+    "light": {
+        "bg":         "#F0F0F0",
+        "fg":         "#1A1A1A",
+        "entry_bg":   "#FFFFFF",
+        "entry_fg":   "#1A1A1A",
+        "btn_bg":     "#E1E1E1",
+        "btn_fg":     "#1A1A1A",
+        "gen_bg":     "#0078D7",
+        "gen_fg":     "#FFFFFF",
+        "frame_bg":   "#F0F0F0",
+        "label_font": ("Arial", 9),
+        "title_font": ("Arial", 13, "bold"),
+    },
+    "dark": {
+        "bg":         "#1E1E1E",
+        "fg":         "#E0E0E0",
+        "entry_bg":   "#2D2D2D",
+        "entry_fg":   "#E0E0E0",
+        "btn_bg":     "#3C3C3C",
+        "btn_fg":     "#E0E0E0",
+        "gen_bg":     "#005A9E",
+        "gen_fg":     "#FFFFFF",
+        "frame_bg":   "#1E1E1E",
+        "label_font": ("Arial", 9),
+        "title_font": ("Arial", 13, "bold"),
+    },
+}
+_current_theme = "light"
+
+
+def _get_theme() -> dict:
+    return _THEMES[_current_theme]
+
+
+def _collect_widgets(widget, result=None):
+    """Recursively collect all widgets in the hierarchy."""
+    if result is None:
+        result = []
+    result.append(widget)
+    for child in widget.winfo_children():
+        _collect_widgets(child, result)
+    return result
+
+
+def _apply_theme():
+    """Re-paint every widget with the active theme colours."""
+    t = _get_theme()
+    root.configure(bg=t["bg"])
+    for w in _collect_widgets(root):
+        cls = w.winfo_class()
+        try:
+            if cls in ("Label", "Checkbutton"):
+                w.configure(bg=t["bg"], fg=t["fg"])
+            elif cls == "Frame":
+                w.configure(bg=t["frame_bg"])
+            elif cls == "Entry":
+                w.configure(bg=t["entry_bg"], fg=t["entry_fg"],
+                            insertbackground=t["fg"],
+                            disabledbackground=t["frame_bg"],
+                            disabledforeground=t["fg"])
+            elif cls == "Button":
+                # Keep the generate button its accent colour
+                current_text = str(w.cget("text"))
+                if "GENERATE" in current_text.upper():
+                    w.configure(bg=t["gen_bg"], fg=t["gen_fg"],
+                                activebackground=t["gen_bg"], activeforeground=t["gen_fg"])
+                else:
+                    w.configure(bg=t["btn_bg"], fg=t["btn_fg"],
+                                activebackground=t["bg"], activeforeground=t["fg"])
+        except tk.TclError:
+            pass  # Some widgets (ttk) ignore configure colour kwargs — safe to skip
+
+
+def toggle_dark_mode():
+    global _current_theme
+    _current_theme = "dark" if _current_theme == "light" else "light"
+    _apply_theme()
+    # Update the menu label to reflect the current state
+    _rebuild_view_menu()
+
+
+def _rebuild_view_menu():
+    """Refresh the View menu label after toggling."""
+    label = "☀  Light Mode" if _current_theme == "dark" else "🌙  Dark Mode"
+    view_menu.entryconfigure(0, label=label)
+
+
+# ---------------------------------------------------------------------------
+# UPDATE CVEs  (git pull on the cvelistV5 repo)
+# ---------------------------------------------------------------------------
+_CVE_REPO_PATH = r"C:\NoCScripts\N-able Tools\CVE_Risk_Exposure_&_Remediation\cvelistV5"
+
+
+def _find_cve_repo() -> Path:
+    """Return the cvelistV5 repo path, searching from the script's location if not found at the default."""
+    default = Path(_CVE_REPO_PATH)
+    if default.exists():
+        return default
+    # Fallback: search up from this script's directory
+    here = Path(sys.argv[0]).resolve().parent
+    for candidate in [here / "cvelistV5", here.parent / "cvelistV5"]:
+        if candidate.exists():
+            return candidate
+    return default  # Return default even if missing — git will report the error clearly
+
+
+def update_cve_list():
+    """Run git pull on the cvelistV5 repo in a background thread, then show the result."""
+    repo = _find_cve_repo()
+
+    def _do_pull():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "pull"],
+                capture_output=True, text=True, timeout=120,
+            )
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            output = stdout or stderr or "(no output)"
+            success = result.returncode == 0
+
+            def _show():
+                if success:
+                    messagebox.showinfo("Update CVEs", f"✔ CVE list updated.\n\n{output}")
+                else:
+                    messagebox.showerror("Update CVEs",
+                        f"git pull returned exit code {result.returncode}.\n\n{output}")
+
+            root.after(0, _show)
+        except FileNotFoundError:
+            root.after(0, lambda: messagebox.showerror(
+                "Update CVEs",
+                "git not found. Ensure Git is installed and on your PATH."
+            ))
+        except subprocess.TimeoutExpired:
+            root.after(0, lambda: messagebox.showerror(
+                "Update CVEs", "git pull timed out after 120 seconds."
+            ))
+        except Exception as exc:
+            _msg = str(exc)
+            root.after(0, lambda: messagebox.showerror("Update CVEs", f"Unexpected error:\n{_msg}"))
+
+    threading.Thread(target=_do_pull, daemon=True).start()
+    messagebox.showinfo("Update CVEs", f"Pulling latest CVEs from:\n{repo}\n\nThis runs in the background…")
+
+
+def show_about():
+    messagebox.showinfo(
+        "About — N-able CVE Dashboard",
+        "N-able CVE Dashboard & Triage Tool\n\n"
+        "Automates month-over-month vulnerability triage from N-able exports.\n\n"
+        "Features:\n"
+        "  • Patch match & evidence scoring\n"
+        "  • Stale device purge from trend math\n"
+        "  • CVE enrichment via NVD / cvelistV5\n"
+        "  • Redetection tracking & root-cause diagnostics\n\n"
+        "© 2026 Stuart Villanti — MIT Licence",
+    )
 
 
 def select_file(label_var, filetypes=None):
@@ -185,14 +351,43 @@ def toggle_trend_state():
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
 root.geometry("570x830")
-# root.configure(bg="black")
-# root.iconbitmap("icon.ico")
 root.resizable(False, True)
-# Set a consistent font for all widgets
+
+# ---------------------------------------------------------------------------
+# MENU BAR
+# The menu bar provides access to the "View" and "Help" menus, allowing users to toggle dark mode and access help features like updating the CVE list and viewing about information.
+# The "View" menu contains a single command to toggle dark mode, which updates the theme of the entire GUI when selected. The "Help" menu contains commands to update the CVE list by performing a git pull on the cvelistV5 repository, and to show an about dialog with information about the tool.
+# The menu bar is a standard part of the GUI, providing easy access to these common actions without cluttering the main interface. The "Update CVEs" action is important for keeping the vulnerability data current, while the "About" section helps users understand the purpose and capabilities of the tool.
+# The dark mode toggle in the View menu allows users to switch to a darker color scheme, which can be easier on the eyes in low-light environments. The menu structure keeps these actions organized and accessible without overwhelming the main workflow of selecting files and generating the dashboard.
+# The implementation of the "Update CVEs" command ensures that the potentially time-consuming git pull operation does not block the GUI, providing a responsive user experience. The about message box gives users a clear overview of what the tool does and who created it, which can be helpful for new users or those looking for more information.
+# The menu bar is created using Tkinter's Menu widget, with cascading submenus for "View" and "Help". Each command in the menus is linked to a corresponding function that handles the action when selected. The menu is configured on the root window, making it accessible throughout the application.
+# The "View" menu allows users to toggle between light and dark themes, while the "Help" menu provides options to update the CVE list and view information about the tool. This structure keeps the GUI organized and user-friendly, allowing users to easily access these features without cluttering the main interface where they select files and generate the dashboard.
+# The use of emojis in the menu labels (e.g. "🌙  Dark Mode") adds a visual cue to indicate the function of the command, enhancing the user experience. The menu commands are designed to provide essential functionality related to maintaining the CVE data and understanding the tool, while keeping the main focus on the dashboard generation workflow
+# The menu bar is a standard feature in desktop applications, and its implementation here follows common conventions for organizing related commands under appropriate categories (View for display settings, Help for support and information). This allows users to easily find and use these features without needing to navigate through the main interface, which is focused on selecting input files and generating the dashboard.
+# ---------------------------------------------------------------------------
+menubar = tk.Menu(root)
+
+# View menu — Dark Mode toggle
+view_menu = tk.Menu(menubar, tearoff=0)
+view_menu.add_command(label="🌙  Dark Mode", command=toggle_dark_mode)
+menubar.add_cascade(label="View", menu=view_menu)
+
+# Help menu
+# The "Update CVEs" command runs a git pull on the cvelistV5 repo in a background thread, then shows the output or any errors in a message box once complete.
+# The "About" command shows an about message box with information about the tool, features, and copyright.
+# The Help menu provides quick access to update the CVE list and learn about the tool, while the View menu allows toggling between light and dark themes for user preference.
+# The menu bar is a standard part of the GUI, providing easy access to these common actions without cluttering the main interface. The "Update CVEs" action is important for keeping the vulnerability data current, while the "About" section helps users understand the purpose and capabilities of the tool.
+# The dark mode toggle in the View menu allows users to switch to a darker color scheme, which can be easier on the eyes in low-light environments. The menu structure keeps these actions organized and accessible without overwhelming the main workflow of selecting files and generating the dashboard.
+# The implementation of the "Update CVEs" command ensures that the potentially time-consuming git pull operation does not block the GUI, providing a responsive user experience. The about message box gives users a clear overview of what the tool does and who created it, which can be helpful for new users or those looking for more information.
+help_menu = tk.Menu(menubar, tearoff=0)
+help_menu.add_command(label="Update CVEs  (git pull cvelistV5)", command=update_cve_list)
+help_menu.add_separator()
+help_menu.add_command(label="About", command=show_about)
+menubar.add_cascade(label="Help", menu=help_menu)
+
+root.config(menu=menubar)
+
 default_font = ("Arial", 10)
-# style = ttk.Style(root)
-# style.configure("TLabel", font=default_font, background="black", foreground="white")
-# style.configure("TButton", font=default_font, background="#0078D7", foreground="white")   
 tk.Label(root, text="N-able CVE Dashboard & Triage Tool",
          font=("Arial", 13, "bold")).pack(pady=(12, 4))
 
