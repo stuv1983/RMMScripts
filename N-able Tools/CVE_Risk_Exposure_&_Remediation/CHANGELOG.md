@@ -43,7 +43,7 @@ Split the monolith into the current module architecture. Tkinter GUI added. Each
 #### Triage Scope Bug (Critical)
 **File:** `orchestrator.py`
 
-`filtered_df` included RESOLVED rows, causing product sheets and "New This Month" to treat resolved Office detections as active. MEDTECH021 Java CVEs showing as new detections despite being fully resolved was the symptom.
+`filtered_df` included RESOLVED rows, causing product sheets and "New This Month" to treat resolved Office detections as active. 
 
 **Fix:** Introduced a clean two-scope system:
 - `filtered_df` — all rows above score threshold (evidence/history scope)
@@ -61,7 +61,7 @@ Default threshold was `9.0` but was being compared against the wrong column in s
 #### RMM Merge — LEFT vs INNER Join
 **File:** `orchestrator.py`
 
-`exclude_missing_rmm=True` caused an INNER join that silently dropped devices not in the RMM inventory before any filtering ran. Devices like LUMIA-CD5383MSY disappeared from the report entirely.
+`exclude_missing_rmm=True` caused an INNER join that silently dropped devices not in the RMM inventory before any filtering ran. 
 
 **Fix:** Default changed to `exclude_missing_rmm=False`. Unmatched devices are marked `'Not Found in RMM'` in the `Last Response` column and excluded from triage sheets but retained in Raw Data.
 
@@ -93,7 +93,7 @@ Both the CVE export and the patch report have a `Status` column. After the panda
 #### Resolved Sheet Consolidation
 **Files:** `excel_builder.py`, `orchestrator.py`
 
-`'Patch Confirmed'` and `'Resolved (Patch Confirmed)'` were separate sheets with overlapping content. The orchestrator now pre-merges all raw `Status=RESOLVED` rows with patch-confirmed rows before writing. Single sheet: `'Resolved (Patch Confirmed)'`. Row count increased from 311 → 6,338 once raw RESOLVED rows were included.
+`'Patch Confirmed'` and `'Resolved (Patch Confirmed)'` were separate sheets with overlapping content. The orchestrator now pre-merges all raw `Status=RESOLVED` rows with patch-confirmed rows before writing. Single sheet: `'Resolved (Patch Confirmed)'`.
 
 ---
 
@@ -253,11 +253,10 @@ Progress bar moved into a fixed-height `tk.Frame` with `pack_propagate(False)`. 
 
 ---
 
-### v0.11 — Garbage Comment Cleanup
+### v0.11 — Garbage Cleanup
 
 **File:** `data_pipeline.py`
 
-Removed 15 lines of AI-generated garbage comments inserted between `load_previous_report` and `_active_trend_scope` that were not code and bloated the file.
 
 Removed redundant duplicate `_sr` assignment in `process_patch_match()` that ran before the `_patch_status` rename (result was immediately overwritten by the post-rename assignment).
 
