@@ -171,10 +171,10 @@ def compute_recommended_actions(root_cause_df: pd.DataFrame,
     }
 
     agg: dict[tuple[str, str], set[str]] = {}
-    for _, row in root_cause_df.iterrows():
-        label  = str(row.get('Patch Evidence Notes', ''))
-        prod   = str(row.get('Product', ''))
-        device = str(row.get('Device', ''))
+    for row in root_cause_df.itertuples(index=False):
+        label  = str(getattr(row, 'Patch_Evidence_Notes', ''))
+        prod   = str(getattr(row, 'Product', ''))
+        device = str(getattr(row, 'Device', ''))
         agg.setdefault((label, prod), set()).add(device)
 
     actions = []
@@ -233,19 +233,19 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
 
     # ── Root cause / Patch Evidence Notes table (simplified columns) ──────────
     rows = []
-    for _, row in df[df["_cause"].notna() | df["_baseline_cause"].notna()].iterrows():
-        cause          = row.get("_cause")
-        baseline_cause = row.get("_baseline_cause")
-        prod           = str(row.get("Affected Products", ""))
-        device_name    = str(row.get("Name", ""))
-        cve_id         = extract_cve_id(str(row.get("Vulnerability Name", "")))
+    for row in df[df["_cause"].notna() | df["_baseline_cause"].notna()].itertuples(index=False):
+        cause          = getattr(row, "_cause", None)
+        baseline_cause = getattr(row, "_baseline_cause", None)
+        prod           = str(getattr(row, "Affected_Products", ""))
+        device_name    = str(getattr(row, "Name", ""))
+        cve_id         = extract_cve_id(str(getattr(row, "Vulnerability_Name", "")))
 
         # Skip pairs already resolved by any method.
         # resolved_pairs may contain 2-tuples (device, cve) or 3-tuples (device, cve, product).
         if resolved_pairs:
             nk = normalize_device_name(device_name)
             from data_pipeline import _detect_product as _dp_det
-            _pk = _dp_det(str(row.get("Affected Products", "")))
+            _pk = _dp_det(str(getattr(row, "Affected_Products", "")))
             if (nk, cve_id) in resolved_pairs or (nk, cve_id, _pk) in resolved_pairs:
                 continue
 
@@ -256,10 +256,10 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
                 "Device":               device_name,
                 "Product":              prod,
                 "CVE":                  cve_id,
-                "Patch Match Result":   row.get("Patch Match Result", ""),
-                "Resolved":             row.get("Patch Evidence Status", ""),
+                "Patch Match Result":   getattr(row, "Patch_Match_Result", ""),
+                "Resolved":             getattr(row, "Patch_Evidence_Status", ""),
                 "Patch Evidence Notes": DISPLAY_MAP.get(cause, "Unresolved"),
-                "Baseline Compliance":  row.get("Baseline Compliance", ""),
+                "Baseline Compliance":  getattr(row, "Baseline_Compliance", ""),
                 "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
                 "_cause_internal":      cause,
             })
@@ -270,10 +270,10 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
                 "Device":               device_name,
                 "Product":              prod,
                 "CVE":                  cve_id,
-                "Patch Match Result":   row.get("Patch Match Result", ""),
-                "Resolved":             row.get("Patch Evidence Status", ""),
+                "Patch Match Result":   getattr(row, "Patch_Match_Result", ""),
+                "Resolved":             getattr(row, "Patch_Evidence_Status", ""),
                 "Patch Evidence Notes": DISPLAY_MAP.get(baseline_cause, ""),
-                "Baseline Compliance":  row.get("Baseline Compliance", ""),
+                "Baseline Compliance":  getattr(row, "Baseline_Compliance", ""),
                 "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
                 "_cause_internal":      baseline_cause,
             })
@@ -292,14 +292,14 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
     # ── Patch lag (resolved pairs) ────────────────────────────────────────────
     lag_rows = []
     if "Patch Install Date" in df.columns and "First detected" in df.columns:
-        for _, row in df[df["Patch Evidence Status"] == "Patch confirmed - pending rescan"].iterrows():
-            idt = pd.to_datetime(row.get("Patch Install Date"), errors="coerce")
-            fdt = pd.to_datetime(row.get("First detected"),     errors="coerce")
+        for row in df[df["Patch Evidence Status"] == "Patch confirmed - pending rescan"].itertuples(index=False):
+            idt = pd.to_datetime(getattr(row, "Patch_Install_Date", None), errors="coerce")
+            fdt = pd.to_datetime(getattr(row, "First_detected", None),     errors="coerce")
             if pd.isna(idt) or pd.isna(fdt): continue
             lag_rows.append({
-                "Device":          row.get("Name", ""),
-                "CVE":             extract_cve_id(str(row.get("Vulnerability Name", ""))),
-                "Product":         row.get("Affected Products", ""),
+                "Device":          getattr(row, "Name", ""),
+                "CVE":             extract_cve_id(str(getattr(row, "Vulnerability_Name", ""))),
+                "Product":         getattr(row, "Affected_Products", ""),
                 "First Detected":  fdt.date(),
                 "Patch Installed": idt.date(),
                 "Lag (days)":      (idt - fdt).days,

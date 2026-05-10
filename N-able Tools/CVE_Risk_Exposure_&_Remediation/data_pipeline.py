@@ -5,6 +5,7 @@ No GUI imports. No xlsxwriter. Pure data in, data out.
 
 import logging
 import os
+from pathlib import Path
 import re
 from datetime import datetime
 from typing import Optional, Set, Tuple
@@ -183,16 +184,16 @@ def parse_last_response(val):
     epoch = pd.to_datetime('1900-01-01')
     if val in ['Not Found in RMM', 'N/A', '']: return epoch
     try: return pd.to_datetime(val)
-    except Exception: pass
+    except (ValueError, TypeError): pass
     if val.startswith('overdue_'):
         try: return pd.to_datetime(val.replace('overdue_', '').split(' -')[0])
-        except Exception: pass
+        except (ValueError, TypeError): pass
     if 'days' in val or 'hrs' in val:
         try:
             m = _DIGITS_RE.search(val)
             days = int(m.group(0)) if m else 0
             return pd.Timestamp.now() - pd.Timedelta(days=days)
-        except Exception: pass
+        except (ValueError, TypeError, AttributeError): pass
     return epoch
 # The get_col_letter function converts a zero-based column index into an Excel column letter. It uses a loop to repeatedly divide the column index by 26 and determine the corresponding letter for each position. This is useful for generating Excel formulas or references that require column letters instead of numeric indices. By providing this utility function, we can easily convert between numeric column indices used in pandas DataFrames and the letter-based column references used in Excel, which is essential for creating accurate formulas and references in the generated dashboard when exporting to Excel. The function handles the conversion correctly by accounting for the fact that Excel columns are 1-indexed and that after 'Z' comes 'AA', 'AB', etc. By using this function, we can ensure that any Excel-related operations in the dashboard generation can reference columns accurately, regardless of how many columns are present in the data.
 def get_col_letter(col_idx):
@@ -650,15 +651,15 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     best_ver: dict[tuple, dict] = {}
-    for _, row in has_ver.iterrows():
-        _patch_arch = _get_arch(str(row.get('Matched Patch', '')))
-        key = (str(row['Name']), str(row['_cascade_pk']), _patch_arch)
-        vt  = row['_vt']
+    for row in has_ver.itertuples(index=False):
+        _patch_arch = _get_arch(str(getattr(row, 'Matched_Patch', '')))
+        key = (str(row.Name), str(row._cascade_pk), _patch_arch)
+        vt  = row._vt
         if key not in best_ver or vt > best_ver[key]['_vt']:
             best_ver[key] = {
                 '_vt':          vt,
-                'version_str':  str(row['Matched Patch Version']),
-                'install_date': row.get('Patch Install Date', pd.NaT),
+                'version_str':  str(getattr(row, 'Matched_Patch_Version', '')),
+                'install_date': getattr(row, 'Patch_Install_Date', pd.NaT),
                 '_arch':        _patch_arch,
             }
 
@@ -689,7 +690,10 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
     if not cascade_resolve:
         return df
 
-    cascade_applied = 0
+    # Collect indices to update rather than writing inside the loop.
+    # iterrows() boxes every row into a Series; using index-collection + bulk
+    # assignment avoids that overhead entirely.
+    resolve_indices: list[int] = []
     for idx, row in df.iterrows():
         if str(row.get('Patch Evidence Status', '')).strip() != 'Unresolved':
             continue
@@ -719,15 +723,17 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
             if (device, pk, cve_id, inst_arch) in cascade_resolve or \
                (not cve_arch and any((device, pk, cve_id, a) in cascade_resolve for a in ['', 'x64', 'x86'])):
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
-                    df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
-                    cascade_applied += 1
+                    resolve_indices.append(idx)
                     break
             elif (device, pk, '_BASELINE_', inst_arch) in cascade_resolve or \
                    (not cve_arch and any((device, pk, '_BASELINE_', a) in cascade_resolve for a in ['', 'x64', 'x86'])):
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
-                    df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
-                    cascade_applied += 1
+                    resolve_indices.append(idx)
                     break
+
+    cascade_applied = len(resolve_indices)
+    if resolve_indices:
+        df.loc[resolve_indices, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
 
     if cascade_applied:
         log.info("Cascade resolution: %d additional rows resolved via version compliance",
@@ -843,13 +849,13 @@ def load_previous_report(file_path):
     try:
         xl = pd.ExcelFile(file_path)
     except PermissionError:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"'{fname}' is currently open in Excel.\n\nPlease close the file in Excel and try again.")
     except FileNotFoundError:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"'{fname}' could not be found.\n\nPlease check the file path and try again.")
     except Exception as e:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"Could not open '{fname}'.\n\nDetails: {e}")
 
     _DASHBOARD_SHEETS = {'Raw Data', 'All Detections'}
@@ -907,10 +913,10 @@ def load_previous_report(file_path):
             if not {'Resolved', 'Name', 'Vulnerability Name'}.issubset(sdf.columns):
                 continue
             checked = sdf[sdf['Resolved'].astype(str).str.strip() == '☑']
-            for _, row in checked.iterrows():
+            for row in checked.itertuples(index=False):
                 resolved_pairs.add((
-                    normalize_device_name(row['Name']),
-                    extract_cve_id(row['Vulnerability Name']),
+                    normalize_device_name(row.Name),
+                    extract_cve_id(getattr(row, 'Vulnerability_Name', '')),
                 ))
         except Exception:
             continue
@@ -1146,20 +1152,20 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
 
     lag_rows = []
     if 'Patch Install Date' in df.columns and 'First detected' in df.columns:
-        for _, row in df.iterrows():
-            install_dt = pd.to_datetime(row.get('Patch Install Date'), errors='coerce')
-            first_dt   = pd.to_datetime(row.get('First detected'),    errors='coerce')
+        for row in df.itertuples(index=False):
+            install_dt = pd.to_datetime(getattr(row, 'Patch_Install_Date', None), errors='coerce')
+            first_dt   = pd.to_datetime(getattr(row, 'First_detected', None),     errors='coerce')
             if pd.isna(install_dt) or pd.isna(first_dt):
                 continue
             lag_days = (install_dt - first_dt).days
             lag_rows.append({
-                'Device':             row.get('Name', ''),
-                'CVE':                extract_cve_id(str(row.get('Vulnerability Name', ''))),
-                'Product':            row.get('Affected Products', ''),
+                'Device':             getattr(row, 'Name', ''),
+                'CVE':                extract_cve_id(str(getattr(row, 'Vulnerability_Name', ''))),
+                'Product':            getattr(row, 'Affected_Products', ''),
                 'First Detected':     first_dt.date(),
                 'Patch Install Date': install_dt.date(),
                 'Lag (days)':         lag_days,
-                'Status':             row.get('Patch Evidence Status', ''),
+                'Status':             getattr(row, 'Patch_Evidence_Status', ''),
             })
     patch_lag_df = (pd.DataFrame(lag_rows)
                     .sort_values('Lag (days)', ascending=False)
@@ -1197,25 +1203,25 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
                         if drift_rows else pd.DataFrame())
 
     mismatch_rows = []
-    for _, row in df.iterrows():
+    for row in df.itertuples(index=False):
         gap = classify_patch_gap(
-            row.get('Patch Match Result', ''),
-            row.get('Patch Evidence Status', ''),
+            getattr(row, 'Patch_Match_Result', ''),
+            getattr(row, 'Patch_Evidence_Status', ''),
         )
         if gap != 'detection_mismatch':
             continue
-        install_dt = pd.to_datetime(row.get('Patch Install Date'), errors='coerce')
-        first_dt   = pd.to_datetime(row.get('First detected'),    errors='coerce')
+        install_dt = pd.to_datetime(getattr(row, 'Patch_Install_Date', None), errors='coerce')
+        first_dt   = pd.to_datetime(getattr(row, 'First_detected', None),     errors='coerce')
         lag = (install_dt - first_dt).days if not (pd.isna(install_dt) or pd.isna(first_dt)) else None
         mismatch_rows.append({
-            'Device':               row.get('Name', ''),
-            'CVE':                  extract_cve_id(str(row.get('Vulnerability Name', ''))),
-            'Product':              row.get('Affected Products', ''),
-            'Patch Match Result':   row.get('Patch Match Result', ''),
-            'Installed Version':    row.get('Matched Patch Version', ''),
-            'Fixed Version Needed': row.get('Fixed Version Used', ''),
-            'Patch Install Date':   row.get('Patch Install Date', ''),
-            'First Detected':       row.get('First detected', ''),
+            'Device':               getattr(row, 'Name', ''),
+            'CVE':                  extract_cve_id(str(getattr(row, 'Vulnerability_Name', ''))),
+            'Product':              getattr(row, 'Affected_Products', ''),
+            'Patch Match Result':   getattr(row, 'Patch_Match_Result', ''),
+            'Installed Version':    getattr(row, 'Matched_Patch_Version', ''),
+            'Fixed Version Needed': getattr(row, 'Fixed_Version_Used', ''),
+            'Patch Install Date':   getattr(row, 'Patch_Install_Date', ''),
+            'First Detected':       getattr(row, 'First_detected', ''),
             'Lag (days)':           lag,
             'Likely Cause':         (
                 'Install predates CVE detection — patch may not address this CVE'
