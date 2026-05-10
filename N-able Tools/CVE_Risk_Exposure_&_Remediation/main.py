@@ -24,7 +24,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from orchestrator import DashboardRequest, DashboardResult, run as run_dashboard
+from orchestrator import DashboardRequest, run as run_dashboard
 
 # ── Appearance ────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -45,6 +45,9 @@ _BLUE_HOVER  = "#144f7a"
 _GREEN       = "#2fa84f"
 _GREEN_HOVER = "#237a3b"
 _MUTED_FG    = "gray60"
+_CARD_FG     = "#1f1f1f"
+_CARD_BORDER = "#333333"
+_DANGER      = "#d9534f"
 
 
 # ===========================================================================
@@ -87,8 +90,8 @@ def _run_in_thread(request, progress_bar):
             _msg = msg
 
             def _on_success():
-                progress_bar.stop()
-                progress_bar.grid_remove()
+                hide_progress()
+                status_var.set("Completed successfully")
                 generate_btn.configure(state="normal")
                 messagebox.showinfo("Done", _msg)
             root.after(0, _on_success)
@@ -97,8 +100,8 @@ def _run_in_thread(request, progress_bar):
             _err = result.message
 
             def _on_failure():
-                progress_bar.stop()
-                progress_bar.grid_remove()
+                hide_progress()
+                status_var.set("Processing failed")
                 generate_btn.configure(state="normal")
                 messagebox.showerror("Error", f"Processing failed:\n{_err}")
             root.after(0, _on_failure)
@@ -110,8 +113,8 @@ def _run_in_thread(request, progress_bar):
         _exc_msg = f"Unexpected error:\n{exc}\n\n{tb}"
 
         def _on_exception():
-            progress_bar.stop()
-            progress_bar.grid_remove()
+            hide_progress()
+            status_var.set("Unexpected error")
             generate_btn.configure(state="normal")
             messagebox.showerror("Error", _exc_msg)
         root.after(0, _on_exception)
@@ -191,8 +194,8 @@ def process_reports():
 
     log.info("Starting dashboard generation: %s", output_path)
     generate_btn.configure(state="disabled")
-    progress_bar.grid()
-    progress_bar.start()
+    status_var.set("Generating dashboard... please wait")
+    show_progress()
     threading.Thread(target=_run_in_thread, args=(request, progress_bar), daemon=True).start()
 
 
@@ -369,15 +372,20 @@ def open_advanced_dialog():
 
 root = ctk.CTk()
 root.title("N-able CVE Dashboard & Triage Tool")
-root.geometry("600x680")
+root.geometry("1040x760")
 root.resizable(True, True)
-root.minsize(520, 600)
-root.state("zoomed")
+root.minsize(860, 640)
+
+# Prefer maximised on Windows, but do not crash on other platforms.
+try:
+    root.state("zoomed")
+except tk.TclError:
+    pass
 
 # ── Menu bar (no CTk equivalent — plain tk.Menu works fine on CTk root) ───────
 menubar   = tk.Menu(root)
 help_menu = tk.Menu(menubar, tearoff=0)
-help_menu.add_command(label="Advanced \u2014 Patch Report Options\u2026", command=open_advanced_dialog)
+help_menu.add_command(label="Advanced — Patch Report Options…", command=open_advanced_dialog)
 help_menu.add_separator()
 help_menu.add_command(label="Update CVE Data  (git pull cvelistV5)", command=update_cve_list)
 help_menu.add_separator()
@@ -385,159 +393,342 @@ help_menu.add_command(label="About", command=show_about)
 menubar.add_cascade(label="Help", menu=help_menu)
 root.configure(menu=menubar)
 
-# ── Scrollable main container ─────────────────────────────────────────────────
-# Wrapping everything in a CTkScrollableFrame means the window stays usable
-# even on small screens without clipping any widgets.
-_scroll = ctk.CTkScrollableFrame(root, fg_color="transparent")
-_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+root.grid_columnconfigure(0, weight=1)
+root.grid_rowconfigure(0, weight=1)
 
-def _section_label(parent, text):
-    """Bold section header with consistent top padding."""
-    ctk.CTkLabel(parent, text=text,
-                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=16, pady=(10, 2))
+# ── Main shell ────────────────────────────────────────────────────────────────
+shell = ctk.CTkFrame(root, fg_color="transparent")
+shell.grid(row=0, column=0, sticky="nsew", padx=18, pady=18)
+shell.grid_columnconfigure(0, weight=1)
+shell.grid_rowconfigure(1, weight=1)
 
-def _muted_label(parent, textvariable=None, text=""):
-    """Small muted-colour helper/status label."""
-    kwargs = dict(text_color=_MUTED_FG, font=ctk.CTkFont(size=11))
-    if textvariable:
-        kwargs["textvariable"] = textvariable
-    else:
-        kwargs["text"] = text
-    ctk.CTkLabel(parent, **kwargs).pack(anchor="w", padx=16, pady=(2, 0))
+# ── Header ───────────────────────────────────────────────────────────────────
+header = ctk.CTkFrame(shell, fg_color="transparent")
+header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+header.grid_columnconfigure(0, weight=1)
 
-# ── Title ─────────────────────────────────────────────────────────────────────
 ctk.CTkLabel(
-    _scroll,
+    header,
     text="N-able CVE Dashboard & Triage Tool",
-    font=ctk.CTkFont(size=18, weight="bold"),
-).pack(pady=(16, 6))
+    font=ctk.CTkFont(size=24, weight="bold"),
+).grid(row=0, column=0, sticky="w")
 
-# ── Vulnerability report ──────────────────────────────────────────────────────
-_section_label(_scroll, "Vulnerability / CVE Report  (CSV or XLSX)")
-vuln_var = tk.StringVar()
-_vf = ctk.CTkFrame(_scroll, fg_color="transparent")
-_vf.pack(fill="x", padx=16)
-vuln_entry = ctk.CTkEntry(_vf, textvariable=vuln_var, state="disabled", width=440)
-vuln_entry.pack(side="left")
-ctk.CTkButton(_vf, text="Browse", width=90,
-              command=lambda: select_file(vuln_var)).pack(side="left", padx=6)
+ctk.CTkLabel(
+    header,
+    text="Build a clean Excel dashboard from vulnerability, RMM, patch and trend exports.",
+    text_color=_MUTED_FG,
+    font=ctk.CTkFont(size=13),
+).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-# ── RMM / Device inventory ────────────────────────────────────────────────────
-_section_label(_scroll, "Device Inventory / RMM Report  (CSV or XLSX)")
-rmm_var = tk.StringVar()
-_rf = ctk.CTkFrame(_scroll, fg_color="transparent")
-_rf.pack(fill="x", padx=16)
-rmm_entry = ctk.CTkEntry(_rf, textvariable=rmm_var, state="disabled", width=380)
-rmm_entry.pack(side="left")
-rmm_browse_btn = ctk.CTkButton(_rf, text="Browse", width=90,
-                                command=lambda: select_file(rmm_var))
-rmm_browse_btn.pack(side="left", padx=6)
-skip_rmm_var = tk.BooleanVar()
-ctk.CTkCheckBox(_scroll, text="Skip RMM (CVE export includes device info)",
-                variable=skip_rmm_var, command=toggle_rmm_state).pack(anchor="w", padx=16, pady=(4, 0))
+ctk.CTkButton(
+    header,
+    text="Advanced Options",
+    width=150,
+    command=open_advanced_dialog,
+).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
-# ── CVE score threshold ───────────────────────────────────────────────────────
-_section_label(_scroll, "Filters")
-_sf = ctk.CTkFrame(_scroll, fg_color="transparent")
-_sf.pack(anchor="w", padx=16)
-ctk.CTkLabel(_sf, text="Minimum CVE Score:").pack(side="left")
-score_var = tk.StringVar(value="9.0")
-ctk.CTkEntry(_sf, textvariable=score_var, width=70).pack(side="left", padx=8)
+# ── Scrollable main container ─────────────────────────────────────────────────
+_scroll = ctk.CTkScrollableFrame(shell, fg_color="transparent")
+_scroll.grid(row=1, column=0, sticky="nsew")
+_scroll.grid_columnconfigure(0, weight=1)
 
-# ── Stale-device cutoff date ──────────────────────────────────────────────────
-_df = ctk.CTkFrame(_scroll, fg_color="transparent")
-_df.pack(anchor="w", padx=16, pady=(6, 0))
-ctk.CTkLabel(_df, text="Exclude stale devices last seen before:").pack(side="left")
-date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
-date_entry = ctk.CTkEntry(_df, textvariable=date_var, width=110)
-date_entry.pack(side="left", padx=8)
-ctk.CTkLabel(_df, text="(dd/mm/yyyy)", text_color=_MUTED_FG,
-             font=ctk.CTkFont(size=11)).pack(side="left")
-show_all_dates_var = tk.BooleanVar()
-ctk.CTkCheckBox(_df, text="Show All Dates",
-                variable=show_all_dates_var, command=toggle_date_state).pack(side="left", padx=10)
-toggle_date_state()
+# ==========================================================================
+# GUI HELPERS
+# ==========================================================================
 
-# ── Report month ──────────────────────────────────────────────────────────────
-_mf = ctk.CTkFrame(_scroll, fg_color="transparent")
-_mf.pack(anchor="w", padx=16, pady=(6, 0))
-ctk.CTkLabel(_mf, text="Report Month:").pack(side="left")
-report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
-ctk.CTkEntry(_mf, textvariable=report_month_var, width=130).pack(side="left", padx=8)
-
-# ── Previous dashboard (trend) ────────────────────────────────────────────────
-_section_label(_scroll, "Previous Dashboard  (optional — month-over-month trends)")
-prev_report_var = tk.StringVar()
-_pf = ctk.CTkFrame(_scroll, fg_color="transparent")
-_pf.pack(fill="x", padx=16)
-prev_report_entry = ctk.CTkEntry(_pf, textvariable=prev_report_var,
-                                  state="disabled", width=380)
-prev_report_entry.pack(side="left")
-prev_report_browse_btn = ctk.CTkButton(
-    _pf, text="Browse", width=90, state="disabled",
-    command=lambda: select_file(prev_report_var, [("Excel Files", "*.xlsx")]),
-)
-prev_report_browse_btn.pack(side="left", padx=6)
-include_trend_var = tk.BooleanVar()
-ctk.CTkCheckBox(_scroll, text="Include month-over-month trend analysis",
-                variable=include_trend_var, command=toggle_trend_state).pack(anchor="w", padx=16, pady=(4, 0))
-
-# ── Sync baselines ────────────────────────────────────────────────────────────
-sync_baselines_var = tk.BooleanVar()
-ctk.CTkCheckBox(_scroll, text="Refresh product baselines before run",
-                variable=sync_baselines_var).pack(anchor="w", padx=16, pady=(6, 0))
-
-# ── Patch StringVars / hidden state ──────────────────────────────────────────
-patch_var           = tk.StringVar()
-failure_var         = tk.StringVar()
-include_patch_var   = tk.BooleanVar()
-include_failure_var = tk.BooleanVar()
-
-# ── Patch status indicator ────────────────────────────────────────────────────
-patch_status_var = tk.StringVar(value="No patch data  (Help \u25b8 Advanced to configure)")
-
-def _update_patch_status(*_):
-    parts = []
-    if include_patch_var.get() and patch_var.get():
-        parts.append(f"Patch: {Path(patch_var.get()).name}")
-    if include_failure_var.get() and failure_var.get():
-        parts.append(f"Failure: {Path(failure_var.get()).name}")
-    patch_status_var.set(
-        "  |  ".join(parts) if parts
-        else "No patch data  (Help \u25b8 Advanced to configure)"
+def _card(parent, title, subtitle=None):
+    """Create a section card with consistent spacing."""
+    frame = ctk.CTkFrame(
+        parent,
+        fg_color=_CARD_FG,
+        border_color=_CARD_BORDER,
+        border_width=1,
+        corner_radius=14,
     )
+    frame.grid(sticky="ew", padx=2, pady=8)
+    frame.grid_columnconfigure(0, weight=1)
 
-patch_var.trace_add("write",           _update_patch_status)
-failure_var.trace_add("write",         _update_patch_status)
-include_patch_var.trace_add("write",   _update_patch_status)
-include_failure_var.trace_add("write", _update_patch_status)
+    ctk.CTkLabel(
+        frame,
+        text=title,
+        font=ctk.CTkFont(size=15, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
 
-_muted_label(_scroll, textvariable=patch_status_var)
+    row = 1
+    if subtitle:
+        ctk.CTkLabel(
+            frame,
+            text=subtitle,
+            text_color=_MUTED_FG,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(2, 8))
+        row = 2
 
-# ── Separator ─────────────────────────────────────────────────────────────────
-ctk.CTkFrame(_scroll, height=2, fg_color="gray30").pack(
-    fill="x", padx=16, pady=(14, 0))
+    return frame, row
 
-# ── Generate button ───────────────────────────────────────────────────────────
-generate_btn = ctk.CTkButton(
+
+def _file_row(parent, row, variable, browse_command, button_text="Browse", state="normal"):
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+    frame.grid(row=row, column=0, sticky="ew", padx=16, pady=(4, 12))
+    frame.grid_columnconfigure(0, weight=1)
+
+    entry = ctk.CTkEntry(frame, textvariable=variable, state=state)
+    entry.grid(row=0, column=0, sticky="ew")
+
+    button = ctk.CTkButton(frame, text=button_text, width=96, command=browse_command, state=state)
+    button.grid(row=0, column=1, padx=(8, 0))
+    return entry, button
+
+
+def _inline_field(parent, row, label, variable, width=120, suffix=None):
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+    frame.grid(row=row, column=0, sticky="w", padx=16, pady=(6, 6))
+    ctk.CTkLabel(frame, text=label).pack(side="left")
+    entry = ctk.CTkEntry(frame, textvariable=variable, width=width)
+    entry.pack(side="left", padx=(8, 8))
+    if suffix:
+        ctk.CTkLabel(frame, text=suffix, text_color=_MUTED_FG, font=ctk.CTkFont(size=11)).pack(side="left")
+    return entry
+
+
+def _filename_or_missing(value, missing="Not selected"):
+    return Path(value).name if value else missing
+
+# ==========================================================================
+# VARIABLES
+# ==========================================================================
+
+vuln_var = tk.StringVar()
+rmm_var = tk.StringVar()
+skip_rmm_var = tk.BooleanVar()
+score_var = tk.StringVar(value="9.0")
+date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
+show_all_dates_var = tk.BooleanVar()
+report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
+prev_report_var = tk.StringVar()
+include_trend_var = tk.BooleanVar()
+sync_baselines_var = tk.BooleanVar()
+patch_var = tk.StringVar()
+failure_var = tk.StringVar()
+include_patch_var = tk.BooleanVar()
+include_failure_var = tk.BooleanVar()
+patch_status_var = tk.StringVar(value="Patch evidence: not configured")
+status_var = tk.StringVar(value="Ready")
+
+# ==========================================================================
+# REQUIRED INPUTS CARD
+# ==========================================================================
+
+inputs_card, row = _card(
     _scroll,
+    "1. Required reports",
+    "Select the current vulnerability export and the matching RMM/device inventory export.",
+)
+
+ctk.CTkLabel(inputs_card, text="Vulnerability / CVE Report  (CSV or XLSX)").grid(
+    row=row, column=0, sticky="w", padx=16, pady=(4, 0)
+)
+row += 1
+vuln_entry, vuln_browse_btn = _file_row(
+    inputs_card,
+    row,
+    vuln_var,
+    lambda: select_file(vuln_var),
+)
+row += 1
+
+ctk.CTkLabel(inputs_card, text="Device Inventory / RMM Report  (CSV or XLSX)").grid(
+    row=row, column=0, sticky="w", padx=16, pady=(2, 0)
+)
+row += 1
+rmm_entry, rmm_browse_btn = _file_row(
+    inputs_card,
+    row,
+    rmm_var,
+    lambda: select_file(rmm_var),
+)
+row += 1
+
+ctk.CTkCheckBox(
+    inputs_card,
+    text="Skip RMM — CVE export already includes device information",
+    variable=skip_rmm_var,
+    command=toggle_rmm_state,
+).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+
+# ==========================================================================
+# FILTERS CARD
+# ==========================================================================
+
+filters_card, row = _card(
+    _scroll,
+    "2. Filters and reporting scope",
+    "Set the CVSS threshold and stale-device handling before generating the workbook.",
+)
+
+score_entry = _inline_field(filters_card, row, "Minimum CVE Score:", score_var, width=80, suffix="Example: 9.0")
+row += 1
+
+# Stale date row
+_date_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
+_date_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(4, 6))
+ctk.CTkLabel(_date_frame, text="Exclude stale devices last seen before:").pack(side="left")
+date_entry = ctk.CTkEntry(_date_frame, textvariable=date_var, width=120)
+date_entry.pack(side="left", padx=(8, 8))
+ctk.CTkLabel(_date_frame, text="dd/mm/yyyy", text_color=_MUTED_FG, font=ctk.CTkFont(size=11)).pack(side="left")
+ctk.CTkCheckBox(
+    _date_frame,
+    text="Show all dates",
+    variable=show_all_dates_var,
+    command=toggle_date_state,
+).pack(side="left", padx=(16, 0))
+row += 1
+
+report_month_entry = _inline_field(filters_card, row, "Report Month:", report_month_var, width=160)
+row += 1
+
+ctk.CTkCheckBox(
+    filters_card,
+    text="Refresh product baselines before run",
+    variable=sync_baselines_var,
+).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 14))
+
+# ==========================================================================
+# OPTIONAL DATA CARD
+# ==========================================================================
+
+optional_card, row = _card(
+    _scroll,
+    "3. Optional evidence and trend data",
+    "Use these when you want patch evidence, failure analysis, or month-over-month comparison.",
+)
+
+ctk.CTkLabel(optional_card, text="Previous Dashboard  (optional — month-over-month trends)").grid(
+    row=row, column=0, sticky="w", padx=16, pady=(4, 0)
+)
+row += 1
+prev_report_entry, prev_report_browse_btn = _file_row(
+    optional_card,
+    row,
+    prev_report_var,
+    lambda: select_file(prev_report_var, [("Excel Files", "*.xlsx")]),
+    state="disabled",
+)
+row += 1
+ctk.CTkCheckBox(
+    optional_card,
+    text="Include month-over-month trend analysis",
+    variable=include_trend_var,
+    command=toggle_trend_state,
+).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 8))
+row += 1
+
+patch_status_label = ctk.CTkLabel(
+    optional_card,
+    textvariable=patch_status_var,
+    text_color=_MUTED_FG,
+    font=ctk.CTkFont(size=12),
+)
+patch_status_label.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+
+# ==========================================================================
+# RUN CARD
+# ==========================================================================
+
+run_card, row = _card(
+    _scroll,
+    "4. Generate dashboard",
+    "You will be prompted where to save the Excel workbook after clicking generate.",
+)
+
+generate_btn = ctk.CTkButton(
+    run_card,
     text="GENERATE COMPLETE DASHBOARD",
     command=process_reports,
     fg_color=_GREEN,
     hover_color=_GREEN_HOVER,
-    font=ctk.CTkFont(size=14, weight="bold"),
-    height=44,
-    corner_radius=18,
+    font=ctk.CTkFont(size=15, weight="bold"),
+    height=48,
+    corner_radius=16,
 )
-generate_btn.pack(padx=16, pady=14, fill="x")
+generate_btn.grid(row=row, column=0, sticky="ew", padx=16, pady=(4, 10))
+row += 1
 
-# ── Progress bar ──────────────────────────────────────────────────────────────
-_prog_frame = ctk.CTkFrame(_scroll, height=20, fg_color="transparent")
-_prog_frame.pack(fill="x", padx=16, pady=(0, 10))
-_prog_frame.pack_propagate(False)
+status_line = ctk.CTkLabel(
+    run_card,
+    textvariable=status_var,
+    text_color=_MUTED_FG,
+    font=ctk.CTkFont(size=12),
+)
+status_line.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 8))
+row += 1
+
+_prog_frame = ctk.CTkFrame(run_card, fg_color="transparent")
 progress_bar = ctk.CTkProgressBar(_prog_frame, mode="indeterminate")
 progress_bar.grid(row=0, column=0, sticky="ew")
-_prog_frame.columnconfigure(0, weight=1)
-progress_bar.grid_remove()
+_prog_frame.grid_columnconfigure(0, weight=1)
+
+
+def show_progress():
+    _prog_frame.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 16))
+    progress_bar.start()
+
+
+def hide_progress():
+    progress_bar.stop()
+    _prog_frame.grid_remove()
+
+hide_progress()
+
+# ==========================================================================
+# STATUS / STATE UPDATES
+# ==========================================================================
+
+def _update_patch_status(*_):
+    parts = []
+    if include_patch_var.get():
+        parts.append(f"Patch: {_filename_or_missing(patch_var.get())}")
+    if include_failure_var.get():
+        parts.append(f"Failure: {_filename_or_missing(failure_var.get())}")
+    patch_status_var.set(
+        "Patch evidence: " + "  |  ".join(parts)
+        if parts else
+        "Patch evidence: not configured — use Advanced Options if required"
+    )
+
+
+def _update_ready_hint(*_):
+    missing = []
+    if not vuln_var.get():
+        missing.append("CVE report")
+    if not skip_rmm_var.get() and not rmm_var.get():
+        missing.append("RMM report")
+    if include_trend_var.get() and not prev_report_var.get():
+        missing.append("previous dashboard")
+    if include_patch_var.get() and not patch_var.get():
+        missing.append("patch report")
+    if include_failure_var.get() and not failure_var.get():
+        missing.append("patch failure report")
+
+    if generate_btn.cget("state") == "disabled":
+        return
+    status_var.set("Ready" if not missing else "Waiting for: " + ", ".join(missing))
+
+
+for _var in (
+    vuln_var, rmm_var, skip_rmm_var, prev_report_var, include_trend_var,
+    patch_var, failure_var, include_patch_var, include_failure_var,
+):
+    _var.trace_add("write", _update_ready_hint)
+
+for _var in (patch_var, failure_var, include_patch_var, include_failure_var):
+    _var.trace_add("write", _update_patch_status)
+
+# Apply initial state.
+toggle_date_state()
+toggle_trend_state()
+toggle_rmm_state()
+_update_patch_status()
+_update_ready_hint()
 
 root.mainloop()
