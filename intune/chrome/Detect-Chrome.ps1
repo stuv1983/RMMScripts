@@ -3,13 +3,13 @@
     Google Chrome Phase 2 Enforcement Detection
 .DESCRIPTION
     Validates Chrome compliance for Microsoft Intune.
-    Fails (Exit 1) if it detects x86 architecture, unmanaged AppData installs, 
+    Fails (Exit 1) if it detects x86 architecture, unmanaged AppData installs,
     outdated versions, or broken/missing servicing engines (Services & Tasks).
 #>
 
 $ChromeSystem64 = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-$Chromex86 = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-$MinimumVersion = [version]"145.0.7632.117" # Update this to your organizational security floor
+$Chromex86      = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+$MinimumVersion = [version]"148.0.7778.97"
 $AppDataInstallFound = $false
 
 # ------------------------------------------------------------------------
@@ -22,13 +22,13 @@ if (Test-Path $Chromex86) {
 }
 
 # Trap 2: Unmanaged per-user AppData installs
-# We strictly exclude default system profiles to avoid regex matching errors
 $ExcludedProfiles = @('Public', 'Default', 'Default User', 'All Users')
-$UserProfiles = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -notin $ExcludedProfiles }
+$UserProfiles = Get-ChildItem "C:\Users" -Directory |
+    Where-Object { $_.Name -notin $ExcludedProfiles }
 
 foreach ($Profile in $UserProfiles) {
-    if (Test-Path (Join-Path $Profile.FullName "AppData\Local\Google\Chrome\Application\chrome.exe")) { 
-        $AppDataInstallFound = $true; break 
+    if (Test-Path (Join-Path $Profile.FullName "AppData\Local\Google\Chrome\Application\chrome.exe")) {
+        $AppDataInstallFound = $true; break
     }
 }
 
@@ -46,8 +46,20 @@ if (-not (Test-Path $ChromeSystem64)) {
     exit 0
 }
 
-# Cast the raw file version to a [version] object to ensure accurate mathematical comparison
-$CurrentVersion = [version](Get-Item $ChromeSystem64).VersionInfo.ProductVersion
+# Use a try/catch around version parsing — ProductVersion can be truncated
+# on some builds (e.g. "148.0.7778" instead of "148.0.7778.97").
+# Fall back to a zero-padded 4-part version so [version] cast never fails.
+try {
+    $rawVersion = (Get-Item $ChromeSystem64).VersionInfo.ProductVersion
+    # Ensure exactly 4 parts by appending ".0" segments if needed
+    $parts = $rawVersion -split '\.'
+    while ($parts.Count -lt 4) { $parts += '0' }
+    $CurrentVersion = [version]($parts -join '.')
+} catch {
+    Write-Output "Non-Compliant (Exit 1): Unable to read Chrome version - $($_.Exception.Message)"
+    exit 1
+}
+
 if ($CurrentVersion -lt $MinimumVersion) {
     Write-Output "Non-Compliant (Exit 1): Chrome version $CurrentVersion is below floor $MinimumVersion."
     exit 1
@@ -56,7 +68,8 @@ if ($CurrentVersion -lt $MinimumVersion) {
 # ------------------------------------------------------------------------
 # 3. SERVICING ENGINE VALIDATION (Services & Tasks)
 # ------------------------------------------------------------------------
-# Chrome services naturally sit at "Automatic" but "Stopped". We only fail if Disabled or Missing.
+# Chrome services naturally sit at "Automatic" but "Stopped".
+# We fail if services are missing OR all are Disabled.
 $UpdateServices = @(Get-Service -Name "gupdate", "gupdatem", "GoogleUpdater*" -ErrorAction SilentlyContinue)
 
 if ($UpdateServices.Count -eq 0) {
@@ -65,19 +78,24 @@ if ($UpdateServices.Count -eq 0) {
 }
 
 if (-not ($UpdateServices | Where-Object { $_.StartType -ne 'Disabled' })) {
-    Write-Output "Non-Compliant (Exit 1): Update services are present but Disabled."
+    Write-Output "Non-Compliant (Exit 1): Update services are present but all Disabled."
     exit 1
 }
 
-# CRITICAL FIX: Wrapped in @() to ensure .Count works even if only 1 task is found.
 # Matches both Legacy (GoogleUpdateTaskMachine) and Modern (GoogleUpdaterTaskSystem) names.
-$Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
-    $_.TaskName -match "^GoogleUpdateTaskMachine" -or 
-    $_.TaskName -match "^GoogleUpdaterTaskSystem" 
+$Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+    $_.TaskName -match "^GoogleUpdateTaskMachine" -or
+    $_.TaskName -match "^GoogleUpdaterTaskSystem"
 })
 
 if ($Tasks.Count -eq 0) {
     Write-Output "Non-Compliant (Exit 1): Google Update Scheduled Tasks are missing."
+    exit 1
+}
+
+# Fail if all matching tasks are disabled (they exist but won't fire)
+if (-not ($Tasks | Where-Object { $_.State -ne 'Disabled' })) {
+    Write-Output "Non-Compliant (Exit 1): Google Update Scheduled Tasks are present but all Disabled."
     exit 1
 }
 
