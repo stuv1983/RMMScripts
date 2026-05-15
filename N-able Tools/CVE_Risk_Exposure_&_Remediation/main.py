@@ -183,6 +183,8 @@ def process_reports():
         include_patch          = include_patch,
         failure_report_path    = failure_var.get() or None,
         include_failure_report = include_failure_var.get(),
+        browser_audit_path     = browser_audit_var.get() or None,
+        include_browser_audit  = include_browser_audit_var.get(),
         prev_report_path       = prev_report_path or None,
         include_trend          = include_trend,
         threshold              = threshold,
@@ -342,6 +344,27 @@ def open_advanced_dialog():
     ctk.CTkCheckBox(dlg, text="Include Patch Failure analysis",
                     variable=include_failure_var, command=_toggle_f).pack(anchor="w", padx=16)
 
+    # ── Browser Audit ─────────────────────────────────────────────────────────
+    ctk.CTkLabel(dlg, text="Browser Audit  (XLSX — from PS browser scan)",
+                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    bf = ctk.CTkFrame(dlg, fg_color="transparent")
+    bf.pack(fill="x", padx=16)
+    _be = ctk.CTkEntry(bf, textvariable=browser_audit_var, width=380,
+                       state="normal" if include_browser_audit_var.get() else "disabled")
+    _be.pack(side="left")
+    _bb = ctk.CTkButton(bf, text="Browse", width=80,
+                        command=lambda: select_file(browser_audit_var, [("Excel Files", "*.xlsx")]),
+                        state="normal" if include_browser_audit_var.get() else "disabled")
+    _bb.pack(side="left", padx=6)
+
+    def _toggle_b():
+        s = "normal" if include_browser_audit_var.get() else "disabled"
+        _be.configure(state=s); _bb.configure(state=s)
+        _refresh_status()
+
+    ctk.CTkCheckBox(dlg, text="Include Browser Audit (merges into Version Drift)",
+                    variable=include_browser_audit_var, command=_toggle_b).pack(anchor="w", padx=16)
+
     # ── Status ────────────────────────────────────────────────────────────────
     _dlg_status_var = tk.StringVar()
 
@@ -351,12 +374,15 @@ def open_advanced_dialog():
             parts.append(f"Patch: {Path(patch_var.get()).name}")
         if include_failure_var.get() and failure_var.get():
             parts.append(f"Failure: {Path(failure_var.get()).name}")
+        if include_browser_audit_var.get() and browser_audit_var.get():
+            parts.append(f"Browser: {Path(browser_audit_var.get()).name}")
         txt = "  |  ".join(parts) if parts else "No patch data selected"
         _dlg_status_var.set(txt)
         _update_patch_status()
 
-    patch_var.trace_add("write",   _refresh_status)
-    failure_var.trace_add("write", _refresh_status)
+    patch_var.trace_add("write",        _refresh_status)
+    failure_var.trace_add("write",      _refresh_status)
+    browser_audit_var.trace_add("write",_refresh_status)
     _refresh_status()
 
     ctk.CTkLabel(dlg, textvariable=_dlg_status_var,
@@ -510,8 +536,10 @@ include_trend_var = tk.BooleanVar()
 sync_baselines_var = tk.BooleanVar()
 patch_var = tk.StringVar()
 failure_var = tk.StringVar()
+browser_audit_var = tk.StringVar()
 include_patch_var = tk.BooleanVar()
 include_failure_var = tk.BooleanVar()
+include_browser_audit_var = tk.BooleanVar()
 patch_status_var = tk.StringVar(value="Patch evidence: not configured")
 status_var = tk.StringVar(value="Ready")
 
@@ -690,6 +718,8 @@ def _update_patch_status(*_):
         parts.append(f"Patch: {_filename_or_missing(patch_var.get())}")
     if include_failure_var.get():
         parts.append(f"Failure: {_filename_or_missing(failure_var.get())}")
+    if include_browser_audit_var.get():
+        parts.append(f"Browser: {_filename_or_missing(browser_audit_var.get())}")
     patch_status_var.set(
         "Patch evidence: " + "  |  ".join(parts)
         if parts else
@@ -709,6 +739,8 @@ def _update_ready_hint(*_):
         missing.append("patch report")
     if include_failure_var.get() and not failure_var.get():
         missing.append("patch failure report")
+    if include_browser_audit_var.get() and not browser_audit_var.get():
+        missing.append("browser audit")
 
     if generate_btn.cget("state") == "disabled":
         return
@@ -718,10 +750,12 @@ def _update_ready_hint(*_):
 for _var in (
     vuln_var, rmm_var, skip_rmm_var, prev_report_var, include_trend_var,
     patch_var, failure_var, include_patch_var, include_failure_var,
+    browser_audit_var, include_browser_audit_var,
 ):
     _var.trace_add("write", _update_ready_hint)
 
-for _var in (patch_var, failure_var, include_patch_var, include_failure_var):
+for _var in (patch_var, failure_var, include_patch_var, include_failure_var,
+             browser_audit_var, include_browser_audit_var):
     _var.trace_add("write", _update_patch_status)
 
 # Apply initial state.

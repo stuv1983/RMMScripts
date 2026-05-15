@@ -22,8 +22,7 @@ from config import (
 # Overall, setting up logging is an important step in building a reliable and maintainable data processing pipeline, and it will help us to ensure that we can effectively monitor and troubleshoot the code as we develop and use it.
 log = logging.getLogger(__name__)
 
-# Use python-calamine as the xlsx engine when available — it reads xlsx files
-# 4-5× faster than openpyxl by delegating to a Rust-based parser.
+# python-calamine reads xlsx 4-5× faster than openpyxl via a Rust parser.
 try:
     import python_calamine  # noqa: F401
     _XLSX_ENGINE: str = 'calamine'
@@ -814,6 +813,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
         how='left', suffixes=('', '_p'),
     )
     merged = merged.sort_values(['_sr', '_pd'], ascending=[False, False], na_position='last')
+    # Avoid MultiIndex.from_product overflow: keep best match per original CVE row.
     merged = merged.reset_index(drop=False)
     best   = merged.drop_duplicates(subset='index', keep='first').drop(columns='index')
 
@@ -835,6 +835,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best.loc[~_has_patch & _in_devices,  'Patch Match Result'] = 'Device in patch report - product not found'
     best.loc[~_has_patch & ~_in_devices, 'Patch Match Result'] = 'Not found in patch report'
 
+    # ── Fixed version & baseline (vectorised) ────────────────────────────────
     def _vec_fixed_version(pk_series, vname_series):
         fv_out, fs_out = [], []
         for pk, vname in zip(pk_series, vname_series):
@@ -857,8 +858,8 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
     _pk_s = best.get('_pk', pd.Series([''] * len(best), index=best.index))
     _fv_vals, _fs_vals = _vec_fixed_version(_pk_s, best['Vulnerability Name'])
-    best['Fixed Version Used']    = _fv_vals
-    best['Fixed Version Source']  = _fs_vals
+    best['Fixed Version Used']      = _fv_vals
+    best['Fixed Version Source']    = _fs_vals
     _bl_vals, _bs_vals = _vec_baseline(_pk_s)
     best['Product Baseline']        = _bl_vals
     best['Product Baseline Source'] = _bs_vals
@@ -867,6 +868,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best['Matched KBs']           = best['_kbs'].apply(
         lambda v: ', '.join(v) if isinstance(v, list) else '')
 
+    # ── Version Check Result (vectorised) ────────────────────────────────────
     _status_s  = best['Status'].astype(str).str.strip()
     _pv_s      = best['Matched Patch Version'].astype(str).str.strip()
     _fv_s      = best['Fixed Version Used'].astype(str).str.strip()
@@ -884,18 +886,22 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
                 out.append('Fixed baseline known - installed version not found')
             else:
                 cmp = _version_gte(pv, fv)
-                out.append('Version compliant' if cmp is True else 'Below fixed version' if cmp is False else 'Version comparison failed')
+                out.append('Version compliant' if cmp is True else
+                           'Below fixed version' if cmp is False else
+                           'Version comparison failed')
         return out
 
     def _vec_bc(status_s, pv_s, bl_s, inst_mask):
         out = []
         for status, pv, bl, inst in zip(status_s, pv_s, bl_s, inst_mask):
-            if not inst:   out.append('Not installed')
-            elif not bl:   out.append('No baseline defined')
-            elif not pv:   out.append('Version unknown')
+            if not inst:  out.append('Not installed')
+            elif not bl:  out.append('No baseline defined')
+            elif not pv:  out.append('Version unknown')
             else:
                 cmp = _version_gte(pv, bl)
-                out.append('Compliant' if cmp is True else 'Below baseline' if cmp is False else 'Version unknown')
+                out.append('Compliant' if cmp is True else
+                           'Below baseline' if cmp is False else
+                           'Version unknown')
         return out
 
     best['Version Check Result'] = _vec_vcr(_status_s, _pv_s, _fv_s, _inst_mask)
@@ -903,12 +909,15 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
     best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
 
-    _vcr_s      = best['Version Check Result'].astype(str).str.strip()
-    _inst_dt    = pd.to_datetime(best['Patch Install Date'], errors='coerce')
+    # ── Patch Evidence Status (vectorised) ───────────────────────────────────
+    _vcr_s   = best['Version Check Result'].astype(str).str.strip()
+    _inst_dt = pd.to_datetime(best['Patch Install Date'], errors='coerce')
     _cve_dates_max = best[['First detected', 'Date Published']].apply(
-        lambda col: pd.to_datetime(col.astype(str).str.replace(' UTC', '', regex=False),
-                                   errors='coerce', utc=True).dt.tz_localize(None)
-        if col.name in best.columns else pd.NaT, axis=0
+        lambda col: pd.to_datetime(
+            col.astype(str).str.replace(' UTC', '', regex=False),
+            errors='coerce', utc=True
+        ).dt.tz_localize(None) if col.name in best.columns else pd.NaT,
+        axis=0,
     ).max(axis=1)
 
     def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
@@ -1001,8 +1010,8 @@ def load_previous_report(file_path):
         'client summary', 'summary',
     }
     resolved_pairs = set()
-    # Use openpyxl read_only streaming to scan product sheets for ☑ checkboxes —
-    # much faster than xl.parse() which fully deserialises each sheet.
+    # Stream product sheets with openpyxl read_only — avoids full DataFrame
+    # deserialisation per sheet (xl.parse was ~2-3s on large workbooks).
     try:
         import openpyxl as _opx
         _wb_ro = _opx.load_workbook(file_path, read_only=True, data_only=True)
@@ -1187,8 +1196,7 @@ def compute_trends(current_df, previous_df, threshold,
         if not keys or df.empty:
             return _drop_internal(df.iloc[0:0].copy())
         _key_df = pd.DataFrame(list(keys), columns=['_Name_Key', '_CVE_Key', '_Product_Key'])
-        _merged = df.merge(_key_df, on=['_Name_Key', '_CVE_Key', '_Product_Key'], how='inner')
-        return _drop_internal(_merged.copy())
+        return _drop_internal(df.merge(_key_df, on=['_Name_Key', '_CVE_Key', '_Product_Key'], how='inner').copy())
 
     new_pairs_df      = _filter_pairs(cur_t,       new_pair_keys).sort_values('Vulnerability Score', ascending=False)
     resolved_df       = _filter_pairs(prev_scoped,  resolved_pair_keys).sort_values('Vulnerability Score', ascending=False)
@@ -1443,3 +1451,156 @@ def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
             'categories':       cats,
         }
     return result
+
+# ==============================================================================
+# BROWSER AUDIT INTEGRATION
+# ==============================================================================
+
+def load_browser_audit(file_path: str) -> pd.DataFrame:
+    """
+    Parse a Browser Audit xlsx (from PS browser scan script).
+    Returns normalised rows with Device, Browser, Version, Architecture,
+    Install Scope, Is 32-bit, Is Per-User/AppData, Username, Last Response.
+    """
+    try:
+        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
+    except Exception as e:
+        log.warning("load_browser_audit: cannot open %s — %s", file_path, e)
+        return pd.DataFrame()
+
+    _BROWSER_SHEETS = {
+        'chrome':  'Google Chrome',
+        'edge':    'Microsoft Edge',
+        'firefox': 'Mozilla Firefox',
+    }
+
+    frames = []
+    for sheet in xl.sheet_names:
+        sl = sheet.lower()
+        browser = next((v for k, v in _BROWSER_SHEETS.items() if k in sl), None)
+        if browser is None:
+            continue
+        try:
+            raw = xl.parse(sheet, header=None)
+        except Exception:
+            continue
+        if raw.empty:
+            continue
+
+        # Detect header row (first row with ≥3 non-null values)
+        header_row = None
+        for idx, row in raw.iterrows():
+            if len(row.dropna()) >= 3:
+                header_row = idx
+                break
+        if header_row is None:
+            continue
+
+        df = xl.parse(sheet, header=header_row)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        rename = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if cl == 'device':                      rename[col] = 'Device'
+            elif cl == 'version':                   rename[col] = 'Version'
+            elif cl == 'architecture':              rename[col] = 'Architecture'
+            elif cl == 'install scope':             rename[col] = 'Install Scope'
+            elif cl == 'install path':              rename[col] = 'Install Path'
+            elif 'is 32' in cl:                     rename[col] = 'Is 32-bit'
+            elif 'per-user' in cl or 'appdata' in cl: rename[col] = 'Is Per-User/AppData'
+            elif cl == 'username':                  rename[col] = 'Username'
+            elif 'last response' in cl:             rename[col] = 'Last Response'
+            elif 'last used' in cl:                 rename[col] = 'Last Used'
+        df = df.rename(columns=rename)
+
+        # Skip sheets that lack required columns (e.g. Firefox Last Used)
+        if 'Version' not in df.columns or 'Device' not in df.columns:
+            continue
+
+        df = df.dropna(subset=['Device', 'Version'], how='any')
+        df = df[df['Version'].astype(str).str.match(r'\d+[\d.]+')]
+        df['Browser'] = browser
+        df['Source']  = 'Browser Audit'
+        frames.append(df)
+
+    if not frames:
+        log.warning("load_browser_audit: no browser sheets found in %s", file_path)
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out['Device']  = out['Device'].astype(str).str.strip()
+    out['Version'] = out['Version'].astype(str).str.strip()
+    return out
+
+
+def merge_browser_audit_into_drift(version_drift_df: pd.DataFrame,
+                                   browser_audit_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enrich version_drift_df with per-user/AppData and 32-bit install counts
+    from the browser audit. Adds an 'Audit Note' column.
+    """
+    if browser_audit_df is None or browser_audit_df.empty:
+        return version_drift_df
+
+    out = version_drift_df.copy() if not version_drift_df.empty else pd.DataFrame()
+
+    _BA_LABEL = {
+        'Google Chrome':   ['Google Chrome'],
+        'Microsoft Edge':  ['Microsoft Edge'],
+        'Mozilla Firefox': ['Mozilla Firefox'],
+    }
+
+    audit_rows = []
+    for browser, labels in _BA_LABEL.items():
+        grp = browser_audit_df[browser_audit_df['Browser'].isin(labels)]
+        if grp.empty:
+            continue
+
+        versions = (grp['Version'].dropna().astype(str).str.strip()
+                    .pipe(lambda s: s[s.str.match(r'\d+[\d.]+')]))
+        uniq_vers = sorted(versions.unique().tolist(),
+                           key=lambda v: tuple(int(x) for x in re.findall(r'\d+', v)) if re.findall(r'\d+', v) else (0,))
+        n_devices = grp['Device'].nunique()
+
+        pu_count  = int(grp['Is Per-User/AppData'].astype(str).str.strip().str.lower()
+                        .isin(['yes', 'true', '1']).sum()) if 'Is Per-User/AppData' in grp.columns else 0
+        bit32_cnt = int(grp['Is 32-bit'].astype(str).str.strip().str.lower()
+                        .isin(['yes', 'true', '1']).sum()) if 'Is 32-bit' in grp.columns else 0
+
+        notes = []
+        if pu_count:   notes.append(f'{pu_count} per-user/AppData install(s)')
+        if bit32_cnt:  notes.append(f'{bit32_cnt} 32-bit install(s) on 64-bit OS')
+        note_str = '; '.join(notes) if notes else '—'
+
+        audit_rows.append({
+            'Product':           browser,
+            'Distinct Versions': len(uniq_vers),
+            'Min Version':       uniq_vers[0]  if uniq_vers else '',
+            'Max Version':       uniq_vers[-1] if uniq_vers else '',
+            'Versions Seen':     ', '.join(uniq_vers),
+            'Device Count':      n_devices,
+            'Audit Note':        note_str,
+        })
+
+    if not audit_rows:
+        return out
+
+    audit_df = pd.DataFrame(audit_rows)
+
+    if out.empty:
+        out = audit_df.copy()
+        return out
+
+    if 'Audit Note' not in out.columns:
+        out['Audit Note'] = '—'
+
+    for _, arow in audit_df.iterrows():
+        prod = arow['Product']
+        mask = out['Product'].astype(str).str.startswith(prod)
+        if mask.any():
+            out.loc[mask, 'Audit Note'] = arow['Audit Note']
+        else:
+            out = pd.concat([out, pd.DataFrame([arow.to_dict()])], ignore_index=True)
+
+    return out
